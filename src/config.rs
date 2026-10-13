@@ -116,7 +116,7 @@ fn locate() -> anyhow::Result<PathBuf> {
     Ok(build)
 }
 
-const SETTING_VARS: &[&str] = &["MUGUET_SCALE", "MUGUET_MOUSE_SENS", "MUGUET_TOUCH_SENS", "MUGUET_RES", "MUGUET_FULLSCREEN", "MUGUET_MUTE", "MUGUET_HOST", "MUGUET_SERVER", "MUGUET_NAME", "MUGUET_SHOW_FPS"];
+const SETTING_VARS: &[&str] = &["MUGUET_SCALE", "MUGUET_MOUSE_SENS", "MUGUET_TOUCH_SENS", "MUGUET_RES", "MUGUET_FULLSCREEN", "MUGUET_MUTE", "MUGUET_HOST", "MUGUET_SERVER", "MUGUET_NAME", "MUGUET_SHOW_FPS", "MUGUET_MODS"];
 
 #[cfg(target_os = "ios")]
 pub fn reload() -> Vec<String> {
@@ -144,6 +144,7 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     if flag("fullscreen") { set_default("MUGUET_FULLSCREEN", "1"); }
     if flag("mute") { set_default("MUGUET_MUTE", "1"); }
     if flag("show_fps") { set_default("MUGUET_SHOW_FPS", "1"); }
+    if flag("mod_menu") { set_default("MUGUET_MODS", "1"); }
 
     let text = |k: &str| cfg.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
     if flag("multiplayer") {

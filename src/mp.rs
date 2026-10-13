@@ -16,8 +16,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("IsPauseMenuActive", "hud_commands::CommandIsPauseMenuActive()"),
     ("SetControlValueNextFrame", "pad_commands::CommandSetControlValueNextFrame(int, int, float)"),
     ("GetVehicleClass", "vehicle_commands::CommandGetVehicleClass(int)"),
+    ("GetEntityForwardVector", "entity_commands::CommandGetEntityForwardVector(int)"),
+    ("IsThisModelAVehicle", "streaming_commands::CommandIsThisModelAVehicle(int)"),
     ("DetachVehicleFromAnyTowTruck", "vehicle_commands::CommandDetachVehicleFromAnyTowTruck(int)"),
     ("GetEntityAttachedToTowTruck", "vehicle_commands::CommandGetEntityAttachedToTowTruck(int)"),
+    ("SetVehicleOnGroundProperly", "vehicle_commands::CommandSetVehicleOnGroundProperly(int, float)"),
     ("IsVehicleAttachedToTrailer", "vehicle_commands::CommandIsVehicleAttachedToTrailer(int)"),
     ("DetachVehicleFromTrailer", "vehicle_commands::CommandDetachVehicleFromTrailer(int)"),
     ("IsVehicleAConvertible", "vehicle_commands::CommandIsVehicleAConvertible(int, bool)"),
@@ -926,6 +929,7 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             for r in requests {
                 handle_request(&mut c, ped, r);
             }
+            spawn_tick(&mut c, ped);
 
             static HORN_AT: Mutex<Option<Instant>> = Mutex::new(None);
             let mut horn_at = HORN_AT.lock().unwrap();
@@ -1117,11 +1121,15 @@ fn vehicle_mode(c: &mut Cmd, ped: i32, in_car: bool) {
     }
 }
 
+static SPAWNING: Mutex<Option<(&'static str, Instant)>> = Mutex::new(None);
+
 fn handle_request(c: &mut Cmd, ped: i32, r: crate::pad::Request) {
     use crate::pad::Request;
-    eprintln!("[touch] {r:?}");
+    eprintln!("[mods] {r:?}");
     let veh = if ped != 0 && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0 { c.i("GetVehiclePedIsIn", &[i(ped), b(false)]) } else { 0 };
     match r {
+        Request::Spawn(name) => *SPAWNING.lock().unwrap() = Some((name, Instant::now())),
+        Request::Fix => if veh != 0 { c.i("SetVehicleFixed", &[i(veh)]); },
         Request::DropTow => {
             if veh != 0 {
                 let towed = c.i("GetEntityAttachedToTowTruck", &[i(veh)]);
@@ -1139,11 +1147,76 @@ fn handle_request(c: &mut Cmd, ped: i32, r: crate::pad::Request) {
                 }
             }
         }
+        Request::Home => jump_to(c, [-852.4, 160.0, 66.6]),
+        Request::Goal => go_to_objective(c),
     }
 }
 
+// loads the model over a few frames, then puts the player in a new vehicle a few metres ahead
+fn spawn_tick(c: &mut Cmd, ped: i32) {
+    let mut s = SPAWNING.lock().unwrap();
+    let Some((name, since)) = *s else { return };
+    let model = proto::joaat(name);
+    if ped == 0 || !c.exists(ped) || c.i("IsThisModelAVehicle", &[i(model as i32)]) == 0 || since.elapsed() > Duration::from_secs(10) {
+        eprintln!("[mods] could not spawn {name}");
+        *s = None;
+        return;
+    }
+    if !model_ready(c, model) { return; }
+    *s = None;
+    let old = if c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0 { c.i("GetVehiclePedIsIn", &[i(ped), b(false)]) } else { 0 };
+    let base = if old != 0 { old } else { ped };
+    let at = c.v("GetEntityCoords", &[i(base), b(false)]);
+    let fwd = c.v("GetEntityForwardVector", &[i(base)]);
+    let heading = c.f("GetEntityHeading", &[i(base)]);
+    // trailers have no seat: drop them behind whatever the player is in, ready to back onto
+    let trailer = name.starts_with("trailer") || name == "tanker";
+    let ahead = if trailer { -10.0 } else if old != 0 { 0.0 } else { 4.0 };
+    if old != 0 && !trailer {
+        let r = c.ref_arg(old);
+        c.i("DeleteVehicle", &[r]);
+    }
+    let pos = c.vec_arg(1, [at[0] + fwd[0] * ahead, at[1] + fwd[1] * ahead, at[2] + 0.5]);
+    let veh = c.i("CreateVehicle", &[i(model as i32), pos, f(heading), b(false), b(false), b(false)]);
+    if veh == 0 {
+        eprintln!("[mods] CreateVehicle failed for {name}");
+        return;
+    }
+    c.i("SetVehicleOnGroundProperly", &[i(veh), f(5.0)]);
+    if !trailer {
+        c.i("SetPedIntoVehicle", &[i(ped), i(veh), i(-1)]);
+        c.i("SetVehicleEngineOn", &[i(veh), b(true), b(true), b(false)]);
+    }
+    let r = c.ref_arg(veh);
+    c.i("SetEntityAsNoLongerNeeded", &[r]);
+    eprintln!("[mods] spawned {name} as {veh}");
+}
 
+fn jump_to(c: &mut Cmd, at: [f32; 3]) {
+    let ped = c.i("PlayerPedId", &[]);
+    if ped == 0 || !c.exists(ped) { return; }
+    let veh = if c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0 { c.i("GetVehiclePedIsIn", &[i(ped), b(false)]) } else { 0 };
+    let pos = c.vec_arg(1, at);
+    c.i("SetEntityCoordsNoOffset", &[i(if veh != 0 { veh } else { ped }), pos, b(false), b(false), b(false)]);
+}
 
+fn go_to_objective(c: &mut Cmd) {
+    let ped = c.i("PlayerPedId", &[]);
+    if ped == 0 || !c.exists(ped) { return; }
+    for sprite in 0..900 {
+        let mut blip = c.i("GetFirstBlipInfoId", &[i(sprite)]);
+        while blip != 0 && c.i("DoesBlipExist", &[i(blip)]) != 0 {
+            if c.i("DoesBlipHaveGpsRoute", &[i(blip)]) != 0 {
+                let at = c.v("GetBlipInfoIdCoord", &[i(blip)]);
+                jump_to(c, [at[0], at[1], at[2] + 1.0]);
+                eprintln!("[debug] jumped to objective blip {blip} (sprite {sprite}) at {at:?}");
+                return;
+            }
+            blip = c.i("GetNextBlipInfoId", &[i(sprite)]);
+        }
+    }
+    eprintln!("[debug] no blip with a gps route");
+}
 
 fn more_bullets(c: &mut Cmd) {
     const ALL: &[&str] = &[

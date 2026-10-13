@@ -43,9 +43,13 @@ pub static INJECT: Mutex<Vec<(i32, f32)>> = Mutex::new(Vec::new());
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 pub enum Request {
+    Spawn(&'static str),
+    Fix,
     DropTow,
     DropTrailer,
     Rope,
+    Home,
+    Goal,
 }
 pub static REQUESTS: Mutex<Vec<Request>> = Mutex::new(Vec::new());
 #[cfg_attr(not(target_os = "ios"), allow(dead_code))]

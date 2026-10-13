@@ -26,6 +26,7 @@ enum Act {
 
     // a game control action held while the button is down, at this value
     Ctrl(i32, f32),
+    Mods,
     Req(crate::pad::Request),
 }
 
@@ -165,6 +166,7 @@ const BUTTONS: &[Spec] = &[
     all(TopLeft(84.0, 30.0), 22.0, "PHONE", KeyNav("ArrowUp")),
     all(TopLeft(138.0, 30.0), 22.0, "MENU\nKEYS", NavToggle),
     all(TopLeft(192.0, 30.0), 22.0, "SWITCH", Key("AltLeft")),
+    all(TopLeft(308.0, 30.0), 22.0, "MODS", Mods),
     n(-135.0, "◀", "ArrowLeft"),
     n(-87.0, "▲", "ArrowUp"),
     n(-39.0, "▼", "ArrowDown"),
@@ -184,6 +186,25 @@ impl Spec {
     }
 }
 
+// the mod menu: a tab per category, and what each entry spawns or does
+const MOD_TABS: &[(&str, &[(&str, crate::pad::Request)])] = {
+    use crate::pad::Request::{Spawn as S, *};
+    &[
+        ("CARS", &[("Adder", S("adder")), ("Zentorno", S("zentorno")), ("T20", S("t20")), ("Sultan", S("sultan")), ("Elegy", S("elegy2")), ("Kuruma", S("kuruma")),
+            ("Buffalo", S("buffalo2")), ("Police", S("police")), ("Taxi", S("taxi")), ("Injection", S("bfinjection")), ("Sandking", S("sandking")), ("Convertible", S("carbonizzare"))]),
+        ("BIKES", &[("Bati", S("bati")), ("Akuma", S("akuma")), ("Hakuchou", S("hakuchou")), ("Sanchez", S("sanchez")), ("Faggio", S("faggio2")), ("Double T", S("double")),
+            ("BMX", S("bmx")), ("Scorcher", S("scorcher")), ("Blazer", S("blazer"))]),
+        ("AIR", &[("Buzzard", S("buzzard")), ("Maverick", S("maverick")), ("Frogger", S("frogger")), ("Cargobob", S("cargobob")), ("Lazer", S("lazer")), ("Hydra", S("hydra")),
+            ("Duster", S("duster")), ("Luxor", S("luxor")), ("Mammatus", S("mammatus")), ("Besra", S("besra"))]),
+        ("HEAVY", &[("Tow truck", S("towtruck")), ("Tow (big)", S("towtruck2")), ("Flatbed", S("flatbed")), ("Phantom", S("phantom")), ("Packer", S("packer")), ("Dump", S("dump")),
+            ("Rhino", S("rhino")), ("Dozer", S("bulldozer")), ("Forklift", S("forklift")), ("Handler", S("handler")), ("Trailer", S("trailers")), ("Tanker", S("tanker"))]),
+        ("BOATS", &[("Seashark", S("seashark")), ("Speeder", S("speeder")), ("Jetmax", S("jetmax")), ("Dinghy", S("dinghy")), ("Marquis", S("marquis")), ("Sub", S("submersible"))]),
+        ("TOOLS", &[("Fix vehicle", Fix), ("Drop towed car", DropTow), ("Go to goal", Goal), ("Michael's house", Home)]),
+    ]
+};
+static MODS_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("MUGUET_MODS").is_ok_and(|v| v != "0"));
+const MOD_COLS: usize = 4;
+const MOD_CELLS: usize = 12;
 
 
 const STICK_RADIUS: f64 = 58.0;
@@ -239,8 +260,118 @@ struct Overlay {
     ctx: u32,
     menu: bool,
     hidden: bool,
+    mods: ModMenu,
     ctrl_since: HashMap<i32, std::time::Instant>,
     injected: Vec<(i32, f32)>,
+}
+
+struct Cell {
+    view: Retained<AnyObject>,
+    label: Retained<AnyObject>,
+    rect: (f64, f64, f64, f64),
+}
+
+struct ModMenu {
+    panel: Retained<AnyObject>,
+    origin: (f64, f64),
+    tabs: Vec<Cell>,
+    cells: Vec<Cell>,
+    tab: usize,
+    open: bool,
+}
+
+fn inside(r: (f64, f64, f64, f64), p: (f64, f64)) -> bool {
+    p.0 >= r.0 && p.0 <= r.0 + r.2 && p.1 >= r.1 && p.1 <= r.1 + r.3
+}
+
+fn cell(parent: &AnyObject, r: (f64, f64, f64, f64), text: &str) -> Cell {
+    unsafe {
+        let view: Retained<AnyObject> = msg_send![class!(UIView), new];
+        let _: () = msg_send![&*view, setFrame: rect(r.0, r.1, r.2, r.3)];
+        let _: () = msg_send![&*view, setUserInteractionEnabled: false];
+        let _: () = msg_send![&*view, setBackgroundColor: &*color(1.0, 0.12)];
+        let layer: *mut AnyObject = msg_send![&*view, layer];
+        let _: () = msg_send![layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![parent, addSubview: &*view];
+        let label: Retained<AnyObject> = msg_send![class!(UILabel), new];
+        let _: () = msg_send![&*label, setFrame: rect(4.0, 0.0, r.2 - 8.0, r.3)];
+        let _: () = msg_send![&*label, setTextColor: &*color(1.0, 0.95)];
+        let font: Retained<AnyObject> = msg_send![class!(UIFont), boldSystemFontOfSize: 13.0f64];
+        let _: () = msg_send![&*label, setFont: &*font];
+        let _: () = msg_send![&*label, setTextAlignment: 1isize];
+        let _: () = msg_send![&*label, setAdjustsFontSizeToFitWidth: true];
+        let _: () = msg_send![&*view, addSubview: &*label];
+        set_text(&label, text);
+        Cell { view, label, rect: r }
+    }
+}
+
+impl ModMenu {
+    fn new(parent: &AnyObject, safe: (f64, f64, f64, f64)) -> ModMenu {
+        let (sx, sy, sw, sh) = safe;
+        let w = (sw - 60.0).min(620.0);
+        let rows = MOD_CELLS.div_ceil(MOD_COLS) as f64;
+        let h = 16.0 + 36.0 + 12.0 + rows * 46.0 + 8.0;
+        let origin = (sx + (sw - w) / 2.0, sy + (sh - h) / 2.0);
+        let panel = unsafe {
+            let v: Retained<AnyObject> = msg_send![class!(UIView), new];
+            let _: () = msg_send![&*v, setFrame: rect(origin.0, origin.1, w, h)];
+            let _: () = msg_send![&*v, setUserInteractionEnabled: false];
+            let _: () = msg_send![&*v, setBackgroundColor: &*color(0.0, 0.78)];
+            let layer: *mut AnyObject = msg_send![&*v, layer];
+            let _: () = msg_send![layer, setCornerRadius: 14.0f64];
+            let _: () = msg_send![parent, addSubview: &*v];
+            v
+        };
+        let tw = (w - 16.0) / MOD_TABS.len() as f64;
+        let tabs = MOD_TABS.iter().enumerate().map(|(k, (name, _))| cell(&panel, (8.0 + k as f64 * tw + 2.0, 12.0, tw - 4.0, 36.0), name)).collect();
+        let cw = (w - 16.0) / MOD_COLS as f64;
+        let cells = (0..MOD_CELLS)
+            .map(|k| cell(&panel, (8.0 + (k % MOD_COLS) as f64 * cw + 3.0, 60.0 + (k / MOD_COLS) as f64 * 46.0, cw - 6.0, 40.0), ""))
+            .collect();
+        let mut m = ModMenu { panel, origin, tabs, cells, tab: 0, open: false };
+        m.show_tab(0);
+        set_hidden(&m.panel, true);
+        m
+    }
+
+    fn show_tab(&mut self, tab: usize) {
+        self.tab = tab;
+        for (k, t) in self.tabs.iter().enumerate() {
+            unsafe { let _: () = msg_send![&*t.view, setBackgroundColor: &*color(1.0, if k == tab { 0.4 } else { 0.12 })]; }
+        }
+        let entries = MOD_TABS[tab].1;
+        for (k, c) in self.cells.iter().enumerate() {
+            set_hidden(&c.view, k >= entries.len());
+            if let Some((name, _)) = entries.get(k) { set_text(&c.label, name); }
+        }
+    }
+
+    fn toggle(&mut self) {
+        self.open = !self.open;
+        set_hidden(&self.panel, !self.open);
+    }
+
+    // true when the touch was the menu's to handle
+    fn tap(&mut self, p: (f64, f64)) -> bool {
+        if !self.open { return false; }
+        let p = (p.0 - self.origin.0, p.1 - self.origin.1);
+        if let Some(k) = self.tabs.iter().position(|t| inside(t.rect, p)) {
+            self.show_tab(k);
+            return true;
+        }
+        let entries = MOD_TABS[self.tab].1;
+        if let Some(k) = self.cells.iter().position(|c| inside(c.rect, p)).filter(|k| *k < entries.len()) {
+            crate::pad::request(entries[k].1);
+            self.toggle();
+            return true;
+        }
+        let frame: CGRect = unsafe { msg_send![&*self.panel, frame] };
+        if !inside((0.0, 0.0, frame.size.width, frame.size.height), p) {
+            self.toggle();
+        }
+        true
+    }
 }
 
 thread_local! {
@@ -489,11 +620,12 @@ pub fn install(window: &Window) {
     let stick_home = (sx + 40.0 + STICK_RADIUS, sy + sh - 30.0 - STICK_RADIUS);
     let stick_base = circle(&root, stick_home, STICK_RADIUS, 1.0, 0.12);
     let stick_knob = circle(&root, stick_home, KNOB_RADIUS, 1.0, 0.3);
+    let mods = ModMenu::new(&root, safe);
     let mut o = Overlay {
         root, buttons, stick_base, stick_knob, stick_home, safe, full: (full.width, full.height), scale,
         grips: HashMap::new(), held: HashSet::new(), since: HashMap::new(),
         mouse_since: [std::time::Instant::now(); 2], lingering: false, mouse: 0, aim_latched: false,
-        nav: false, in_car: false, mode: FOOT, ctx: 0, menu: false, hidden: false,
+        nav: false, in_car: false, mode: FOOT, ctx: 0, menu: false, hidden: false, mods,
         ctrl_since: HashMap::new(), injected: Vec::new(),
     };
     o.relabel();
@@ -514,6 +646,7 @@ impl Overlay {
         let s = &BUTTONS[idx];
         if s.nav && !self.nav { return None; }
         if s.need & self.ctx != s.need || s.unless & self.ctx != 0 { return None; }
+        if matches!(s.acts[self.mode], Some((_, Mods))) && !*MODS_ON { return None; }
         s.acts[self.mode]
     }
 
@@ -558,12 +691,17 @@ impl Overlay {
         let p = (t.location.x / self.scale, t.location.y / self.scale);
         match t.phase {
             TouchPhase::Started => {
+                let mods_button = self.button_at(p).filter(|&i| matches!(self.spec_act(i), Some((_, Mods))));
+                if mods_button.is_none() && self.mods.tap(p) {
+                    return;
+                }
                 if let Some(idx) = self.button_at(p) {
                     self.grips.insert(t.id, Grip::Button { idx, start: p, last: p });
                     match self.spec_act(idx).map(|(_, a)| a) {
                         Some(AimToggle) => self.aim_latched = !self.aim_latched,
                         Some(NavToggle) => { self.nav = !self.nav; self.relabel(); }
                         Some(KeyNav(_)) if !self.nav => { self.nav = true; self.relabel(); }
+                        Some(Mods) => self.mods.toggle(),
                         Some(Req(r)) => crate::pad::request(r),
                         _ => {}
                     }
