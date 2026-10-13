@@ -194,7 +194,7 @@ const MOD_TABS: &[(&str, &[(&str, crate::pad::Request)])] = {
             ("Buffalo", S("buffalo2")), ("Police", S("police")), ("Taxi", S("taxi")), ("Injection", S("bfinjection")), ("Sandking", S("sandking")), ("Convertible", S("carbonizzare"))]),
         ("BIKES", &[("Bati", S("bati")), ("Akuma", S("akuma")), ("Hakuchou", S("hakuchou")), ("Sanchez", S("sanchez")), ("Faggio", S("faggio2")), ("Double T", S("double")),
             ("BMX", S("bmx")), ("Scorcher", S("scorcher")), ("Blazer", S("blazer"))]),
-        ("AIR", &[("Buzzard", S("buzzard")), ("Maverick", S("maverick")), ("Frogger", S("frogger")), ("Cargobob", S("cargobob")), ("Lazer", S("lazer")), ("Hydra", S("hydra")),
+        ("AIR", &[("Buzzard", S("buzzard")), ("Maverick", S("maverick")), ("Frogger", S("frogger")), ("Cargobob", S("cargobob")), ("Lazer", S("lazer")),
             ("Duster", S("duster")), ("Luxor", S("luxor")), ("Mammatus", S("mammatus")), ("Besra", S("besra"))]),
         ("HEAVY", &[("Tow truck", S("towtruck")), ("Tow (big)", S("towtruck2")), ("Flatbed", S("flatbed")), ("Phantom", S("phantom")), ("Packer", S("packer")), ("Dump", S("dump")),
             ("Rhino", S("rhino")), ("Dozer", S("bulldozer")), ("Forklift", S("forklift")), ("Handler", S("handler")), ("Trailer", S("trailers")), ("Tanker", S("tanker"))]),
