@@ -772,6 +772,49 @@ enum MapKind {
 
 struct AstcJob { tex_id: u32, tex: Texture, mip: u32, origin: Origin3d, bx: u32, by: u32, layers: u32, dst_row: u32, src_word: u32, dst_byte: u64, first_block: u32 }
 
+static GPU_THREADS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_GPU_THREADS").is_ok_and(|v| v == "2"));
+
+enum QOp {
+    Submit(CommandEncoder, u64),
+    WriteBuffer(Buffer, u64, Vec<u8>),
+    WriteTexture(Texture, u32, Origin3d, Vec<u8>, TexelCopyBufferLayout, Extent3d),
+    Present(SurfaceTexture),
+    MapRead(Buffer, Arc<AtomicBool>),
+    OnDone(Box<dyn FnOnce() + Send>),
+}
+
+#[derive(Default)]
+struct SubmitState { seq: u64, indices: std::collections::VecDeque<(u64, SubmissionIndex)>, presented: u64 }
+
+#[derive(Default)]
+struct Submitted {
+    state: Mutex<SubmitState>,
+    cv: std::sync::Condvar,
+}
+
+fn run_qop(queue: &Queue, done: &Submitted, op: QOp) {
+    match op {
+        QOp::Submit(enc, seq) => {
+            let idx = queue.submit([enc.finish()]);
+            let mut s = done.state.lock().unwrap();
+            s.seq = seq;
+            s.indices.push_back((seq, idx));
+            if s.indices.len() > 64 { s.indices.pop_front(); }
+            done.cv.notify_all();
+        }
+        QOp::WriteBuffer(b, off, data) => queue.write_buffer(&b, off, &data),
+        QOp::WriteTexture(t, mip, origin, data, layout, size) => queue.write_texture(
+            TexelCopyTextureInfo { texture: &t, mip_level: mip, origin, aspect: TextureAspect::All }, &data, layout, size),
+        QOp::Present(frame) => {
+            queue.present(frame);
+            done.state.lock().unwrap().presented += 1;
+            done.cv.notify_all();
+        }
+        QOp::MapRead(b, flag) => b.slice(..).map_async(MapMode::Read, move |r| { if r.is_err() { log("map failed"); } flag.store(true, Ordering::SeqCst); }),
+        QOp::OnDone(f) => queue.on_submitted_work_done(f),
+    }
+}
+
 pub struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
@@ -846,8 +889,12 @@ pub struct Gpu {
     pending_maps: Vec<PendingMap>,
     counter_src: Option<Buffer>,
     counter_slot: u32,
-    frame_slot_done: Vec<Option<SubmissionIndex>>,
-    last_submit: Option<SubmissionIndex>,
+    frame_slot_done: Vec<Option<u64>>,
+    last_submit: Option<u64>,
+    qtx: Option<std::sync::mpsc::Sender<QOp>>,
+    submitted: Arc<Submitted>,
+    sent: u64,
+    presents_sent: u64,
     vb_avail: [u64; 16],
     dbg_idx: u64,
 
@@ -972,6 +1019,17 @@ impl Gpu {
             }
             Some(job_tx)
         };
+        let submitted = Arc::new(Submitted::default());
+        let qtx = GPU_THREADS.then(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<QOp>();
+            let (q, done) = (queue.clone(), submitted.clone());
+            std::thread::Builder::new().name("gpu-submit".into()).spawn(move || {
+                crate::set_interactive_qos();
+                for op in rx { run_qop(&q, &done, op); }
+            }).expect("spawn gpu-submit thread");
+            log("gpu: submits, uploads and presents run on a second thread");
+            tx
+        });
         Ok(Gpu {
             live_queries: Default::default(), query_done: Default::default(), stale_query_writes: 0, bc_live: HashMap::new(),
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
@@ -984,7 +1042,7 @@ impl Gpu {
             proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
-            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
+            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, qtx, submitted, sent: 0, presents_sent: 0, vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0, errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
@@ -1093,6 +1151,33 @@ impl Gpu {
             self.pass_st = PassSt::default();
         }
     }
+    fn q(&mut self, op: QOp) {
+        match &self.qtx {
+            Some(tx) => { let _ = tx.send(op); }
+            None => run_qop(&self.queue, &self.submitted, op),
+        }
+    }
+    fn write_buffer(&mut self, buf: &Buffer, offset: u64, data: &[u8]) {
+        if self.qtx.is_some() { self.q(QOp::WriteBuffer(buf.clone(), offset, data.to_vec())); } else { self.queue.write_buffer(buf, offset, data); }
+    }
+    fn write_texture(&mut self, tex: &Texture, mip: u32, origin: Origin3d, data: &[u8], layout: TexelCopyBufferLayout, size: Extent3d) {
+        if self.qtx.is_some() {
+            self.q(QOp::WriteTexture(tex.clone(), mip, origin, data.to_vec(), layout, size));
+        } else {
+            self.queue.write_texture(TexelCopyTextureInfo { texture: tex, mip_level: mip, origin, aspect: TextureAspect::All }, data, layout, size);
+        }
+    }
+    /// The submission index of `seq`, once the submit thread has submitted it.
+    fn submitted_index(&self, seq: u64) -> Option<SubmissionIndex> {
+        let mut s = self.submitted.state.lock().unwrap();
+        while s.seq < seq { s = self.submitted.cv.wait(s).unwrap(); }
+        s.indices.iter().find(|(q, _)| *q == seq).map(|(_, i)| i.clone())
+    }
+    /// Waits until every queued submit has reached the GPU queue.
+    fn sync(&self) {
+        if self.qtx.is_some() && self.sent > 0 { let _ = self.submitted_index(self.sent); }
+    }
+
     fn flush(&mut self) {
         self.flush_astc();
         self.astc_in_encoder = 0;
@@ -1100,8 +1185,10 @@ impl Gpu {
         self.flush_uniforms();
         let resolves = if self.pending_resolve.is_empty() { None } else { self.record_resolves() };
         if let Some(enc) = self.enc.take() {
-            let idx = self.queue.submit([enc.finish()]);
-            self.last_submit = Some(idx);
+            self.sent += 1;
+            let seq = self.sent;
+            self.q(QOp::Submit(enc, seq));
+            self.last_submit = Some(seq);
             self.submits += 1;
             self.on_submitted();
             self.counter_slot = 0;
@@ -1119,6 +1206,7 @@ impl Gpu {
         log("running");
         loop {
             if SUSPENDED.load(Ordering::Relaxed) {
+                self.sync();
                 let _ = self.device.poll(PollType::Wait { submission_index: None, timeout: None });
                 while SUSPENDED.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(50)); }
             }
@@ -1191,6 +1279,7 @@ impl Gpu {
             7 => self.present(u(0)),
             8 => {
                 self.flush();
+                self.sync();
                 let _ = self.device.poll(PollType::Wait { submission_index: None, timeout: None });
                 let addr = u(0) as u64 + u(1) as u64 * 4294967296;
                 atomic(&self.mem, addr).store(u(2) as i32, Ordering::SeqCst);
@@ -1410,11 +1499,11 @@ impl Gpu {
         let Some(g) = b.gpu.clone() else { return };
         if !no_overwrite && used { self.flush(); }
         let n = size & !3;
-        if n > 0 { self.queue.write_buffer(&g, offset, &data[..n as usize]); }
+        if n > 0 { self.write_buffer(&g, offset, &data[..n as usize]); }
         if size & 3 != 0 {
             let mut tail = [0u8; 4];
             tail[..(size - n) as usize].copy_from_slice(&data[n as usize..]);
-            self.queue.write_buffer(&g, offset + n, &tail);
+            self.write_buffer(&g, offset + n, &tail);
         }
     }
 
@@ -1470,8 +1559,8 @@ impl Gpu {
             data = out;
             bpr = w * 4;
         }
-        self.queue.write_texture(
-            TexelCopyTextureInfo { texture: &tex, mip_level: mip, origin: Origin3d { x, y, z: if three { z } else { slice } }, aspect: TextureAspect::All },
+        self.write_texture(
+            &tex, mip, Origin3d { x, y, z: if three { z } else { slice } },
             &data,
             TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
             Extent3d { width: w, height: h, depth_or_array_layers: d.max(1) },
@@ -1680,7 +1769,7 @@ impl Gpu {
                 }
                 let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
                 let b = self.device.create_buffer(&BufferDescriptor { label: None, size: (bytes.len() as u64).max(16), usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
-                self.queue.write_buffer(&b, 0, &bytes);
+                self.write_buffer(&b, 0, &bytes);
                 consts = Some(b);
             }
         }
@@ -2255,7 +2344,11 @@ impl Gpu {
             for c in slot.iter_mut() {
                 if c.lo >= c.hi { continue; }
                 let hi = ((c.hi + 3) & !3).min(c.stage.len() as u64);
-                self.queue.write_buffer(&c.buf, c.base + c.lo, &c.stage[c.lo as usize..hi as usize]);
+                let data = &c.stage[c.lo as usize..hi as usize];
+                match &self.qtx {
+                    Some(tx) => { let _ = tx.send(QOp::WriteBuffer(c.buf.clone(), c.base + c.lo, data.to_vec())); }
+                    None => self.queue.write_buffer(&c.buf, c.base + c.lo, data),
+                }
                 c.lo = u64::MAX;
                 c.hi = 0;
             }
@@ -2953,7 +3046,7 @@ impl Gpu {
             } else {
                 self.flush();
                 let data: Vec<u8> = (0..bytes / 4).flat_map(|i| values[(i & 3) as usize].to_le_bytes()).collect();
-                self.queue.write_buffer(&g, 0, &data);
+                self.write_buffer(&g, 0, &data);
             }
             self.use_buf(res);
             return;
@@ -2992,8 +3085,8 @@ impl Gpu {
             }
         }
         for l in 0..layers {
-            self.queue.write_texture(
-                TexelCopyTextureInfo { texture: &tex, mip_level: a, origin: Origin3d { x: 0, y: 0, z: l }, aspect: TextureAspect::All },
+            self.write_texture(
+                &tex, a, Origin3d { x: 0, y: 0, z: l },
                 &data, TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * bpt), rows_per_image: Some(h) },
                 Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
@@ -3230,12 +3323,13 @@ impl Gpu {
     fn map_pending(&mut self, buf: Buffer, kind: MapKind) {
         let done = Arc::new(AtomicBool::new(false));
         let d2 = done.clone();
-        buf.slice(..).map_async(MapMode::Read, move |r| { if r.is_err() { log("map failed"); } d2.store(true, Ordering::SeqCst); });
+        self.q(QOp::MapRead(buf.clone(), d2));
         self.pending_maps.push(PendingMap { buf, done, kind });
     }
 
     fn process_maps(&mut self, wait: bool) {
         if self.pending_maps.is_empty() { return; }
+        if wait { self.sync(); }
         let _ = self.device.poll(if wait { PollType::Wait { submission_index: None, timeout: None } } else { PollType::Poll });
         let mut i = 0;
         while i < self.pending_maps.len() {
@@ -3368,11 +3462,11 @@ impl Gpu {
             let addrs: Vec<(u64, u64, u32)> = evs.iter().filter_map(|(id, seq, v)| match self.obj(*id) { Some(Obj::Query(q)) => Some((q.addr, *v, *seq)), _ => None }).collect();
             let results = self.query_done.clone();
             let ring = self.ring;
-            self.queue.on_submitted_work_done(move || {
+            self.q(QOp::OnDone(Box::new(move || {
                 results.lock().unwrap().extend(addrs);
                 inflight.fetch_sub(1, Ordering::SeqCst);
                 let _ = mem.atomic_notify(ring, u32::MAX);
-            });
+            })));
         }
     }
 
@@ -3386,7 +3480,7 @@ impl Gpu {
         let slot = self.counter_slot as u64;
         self.counter_slot += 1;
         let src = self.counter_src.clone().unwrap();
-        self.queue.write_buffer(&src, slot * 4, &value.to_le_bytes());
+        self.write_buffer(&src, slot * 4, &value.to_le_bytes());
         self.end_pass();
         let Some(cb) = self.counter_buffer(res) else { return };
         self.encoder().copy_buffer_to_buffer(&src, slot * 4, &cb, 0, 4);
@@ -3410,6 +3504,7 @@ impl Gpu {
             let tex = t.tex.clone();
             self.end_pass();
             if self.surface_size != (w, h) {
+                self.sync();
                 let (surface, window) = self.surface.as_ref().unwrap();
                 let caps = surface.get_capabilities(&self.adapter);
                 surface.configure(&self.device, &SurfaceConfiguration {
@@ -3443,6 +3538,10 @@ impl Gpu {
                     dev.create_bind_group(&BindGroupDescriptor { label: None, layout: &blit.get_bind_group_layout(0), entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&v) }] })
                 }).clone()
             };
+            if self.qtx.is_some() {
+                let mut s = self.submitted.state.lock().unwrap();
+                while s.presented < self.presents_sent { s = self.submitted.cv.wait(s).unwrap(); }
+            }
             let frame = match self.surface.as_ref().unwrap().0.get_current_texture() {
                 CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
                 other => { log_once("surface", &format!("surface texture unavailable: {other:?}")); self.surface_size = (0, 0); None }
@@ -3462,7 +3561,8 @@ impl Gpu {
                     p.draw(0..3, 0..1);
                 }
                 self.flush();
-                self.queue.present(frame);
+                self.presents_sent += 1;
+                self.q(QOp::Present(frame));
             } else {
                 self.flush();
             }
@@ -3479,8 +3579,10 @@ impl Gpu {
         self.ubo_slot = (self.ubo_slot + 1) % FRAME_SLOTS;
         self.ubo_chunk = 0;
         self.ubo_off = 0;
-        if let Some(idx) = self.frame_slot_done[self.ubo_slot].take() {
-            let _ = self.device.poll(PollType::Wait { submission_index: Some(idx), timeout: None });
+        if let Some(seq) = self.frame_slot_done[self.ubo_slot].take() {
+            if let Some(idx) = self.submitted_index(seq) {
+                let _ = self.device.poll(PollType::Wait { submission_index: Some(idx), timeout: None });
+            }
         }
         self.process_maps(false);
     }
