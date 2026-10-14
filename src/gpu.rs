@@ -777,6 +777,7 @@ static GPU_THREADS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_GPU_
 enum QOp {
     Submit(CommandEncoder, u64),
     WriteBuffer(Buffer, u64, Vec<u8>),
+    WriteStage(Buffer, u64, Vec<u8>, std::ops::Range<usize>, std::sync::mpsc::Sender<Vec<u8>>),
     WriteTexture(Texture, u32, Origin3d, Vec<u8>, TexelCopyBufferLayout, Extent3d),
     Present(SurfaceTexture),
     MapRead(Buffer, Arc<AtomicBool>),
@@ -803,6 +804,10 @@ fn run_qop(queue: &Queue, done: &Submitted, op: QOp) {
             done.cv.notify_all();
         }
         QOp::WriteBuffer(b, off, data) => queue.write_buffer(&b, off, &data),
+        QOp::WriteStage(b, off, data, range, back) => {
+            queue.write_buffer(&b, off, &data[range]);
+            let _ = back.send(data);
+        }
         QOp::WriteTexture(t, mip, origin, data, layout, size) => queue.write_texture(
             TexelCopyTextureInfo { texture: &t, mip_level: mip, origin, aspect: TextureAspect::All }, &data, layout, size),
         QOp::Present(frame) => {
@@ -895,6 +900,7 @@ pub struct Gpu {
     submitted: Arc<Submitted>,
     sent: u64,
     presents_sent: u64,
+    stage_back: (std::sync::mpsc::Sender<Vec<u8>>, std::sync::mpsc::Receiver<Vec<u8>>),
     vb_avail: [u64; 16],
     dbg_idx: u64,
 
@@ -1042,7 +1048,7 @@ impl Gpu {
             proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
-            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, qtx, submitted, sent: 0, presents_sent: 0, vb_avail: [0; 16],
+            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, qtx, submitted, sent: 0, presents_sent: 0, stage_back: std::sync::mpsc::channel(), vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0, errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
@@ -1499,12 +1505,22 @@ impl Gpu {
         let Some(g) = b.gpu.clone() else { return };
         if !no_overwrite && used { self.flush(); }
         let n = size & !3;
-        if n > 0 { self.write_buffer(&g, offset, &data[..n as usize]); }
+        let mut tail = None;
         if size & 3 != 0 {
-            let mut tail = [0u8; 4];
-            tail[..(size - n) as usize].copy_from_slice(&data[n as usize..]);
-            self.write_buffer(&g, offset + n, &tail);
+            let mut t = [0u8; 4];
+            t[..(size - n) as usize].copy_from_slice(&data[n as usize..]);
+            tail = Some(t);
         }
+        if n > 0 {
+            if self.qtx.is_some() {
+                let mut data = data;
+                data.truncate(n as usize);
+                self.q(QOp::WriteBuffer(g.clone(), offset, data));
+            } else {
+                self.write_buffer(&g, offset, &data[..n as usize]);
+            }
+        }
+        if let Some(t) = tail { self.write_buffer(&g, offset + n, &t); }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1559,12 +1575,16 @@ impl Gpu {
             data = out;
             bpr = w * 4;
         }
-        self.write_texture(
-            &tex, mip, Origin3d { x, y, z: if three { z } else { slice } },
-            &data,
+        let (origin, layout, extent) = (
+            Origin3d { x, y, z: if three { z } else { slice } },
             TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
             Extent3d { width: w, height: h, depth_or_array_layers: d.max(1) },
         );
+        if self.qtx.is_some() {
+            self.q(QOp::WriteTexture(tex.clone(), mip, origin, data, layout, extent));
+        } else {
+            self.write_texture(&tex, mip, origin, &data, layout, extent);
+        }
     }
 
     const ASTC_BATCH_JOBS: usize = 1024;
@@ -2344,10 +2364,12 @@ impl Gpu {
             for c in slot.iter_mut() {
                 if c.lo >= c.hi { continue; }
                 let hi = ((c.hi + 3) & !3).min(c.stage.len() as u64);
-                let data = &c.stage[c.lo as usize..hi as usize];
                 match &self.qtx {
-                    Some(tx) => { let _ = tx.send(QOp::WriteBuffer(c.buf.clone(), c.base + c.lo, data.to_vec())); }
-                    None => self.queue.write_buffer(&c.buf, c.base + c.lo, data),
+                    Some(tx) => {
+                        let stage = std::mem::take(&mut c.stage);
+                        let _ = tx.send(QOp::WriteStage(c.buf.clone(), c.base + c.lo, stage, c.lo as usize..hi as usize, self.stage_back.0.clone()));
+                    }
+                    None => self.queue.write_buffer(&c.buf, c.base + c.lo, &c.stage[c.lo as usize..hi as usize]),
                 }
                 c.lo = u64::MAX;
                 c.hi = 0;
@@ -2365,6 +2387,7 @@ impl Gpu {
         let end = (off + pack.size) as usize;
         let mut stage_buf = {
             let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
+            if chunk.stage.is_empty() { if let Ok(v) = self.stage_back.1.try_recv() { chunk.stage = v; } }
             if chunk.stage.len() < end { chunk.stage.resize((end.max(262144)).next_power_of_two().min(RING_CHUNK as usize), 0); }
             std::mem::take(&mut chunk.stage)
         };
