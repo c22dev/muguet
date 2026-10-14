@@ -28,6 +28,8 @@ For iOS, also :
 - a device on iOS 15 or later, ideally 8 GB of RAM
 
 ## Building
+New to this ? [INSTALL.md](INSTALL.md) walks you through installing it on a Mac or an iPhone / iPad, step by step
+
 The easy way, paste this in Terminal :
 ```
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/c22dev/muguet/main/build.sh)"
