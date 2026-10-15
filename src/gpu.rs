@@ -772,6 +772,8 @@ enum MapKind {
 
 struct AstcJob { tex_id: u32, tex: Texture, mip: u32, origin: Origin3d, bx: u32, by: u32, layers: u32, dst_row: u32, src_word: u32, dst_byte: u64, first_block: u32 }
 
+static LAZY_RO: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_LAZY_RO").is_ok_and(|v| v == "1"));
+
 pub struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
@@ -795,6 +797,7 @@ pub struct Gpu {
     pass_st: PassSt,
     s: State,
     pdirty: bool,
+    ds_direct: bool,
     last_pl: Option<Rc<Pl>>,
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
@@ -977,7 +980,7 @@ impl Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
+            map_programs: HashMap::new(), s: State::new(), pdirty: true, ds_direct: false, last_pl: None, shader_index, shader_dir, next_uid: 1,
             bgl_cache: FxHashMap::default(), empty_bgl: None, pipelines: FxHashMap::default(), compute: HashMap::new(), bind_groups: FxHashMap::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
@@ -1844,8 +1847,32 @@ impl Gpu {
         let mut key = Vec::with_capacity(37);
         for r in &self.s.rt { key.extend([r.tex, r.mip, r.slice, r.fmt]); }
         let d = &self.s.ds;
-        key.extend([d.tex, d.mip, d.slice, d.fmt, d.flags]);
-        if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) { return true; }
+        let logical = d.flags & 3;
+        key.extend([d.tex, d.mip, d.slice, d.fmt]);
+        // A read-only depth bind only needs a read-only attachment when a draw samples the
+        // depth texture directly; otherwise keep the pass and switch writes off in the pipeline.
+        let phys = if !*LAZY_RO || logical == 0 { logical } else {
+            let sticky = self.pass.is_some() && self.pass_key.as_ref().is_some_and(|k| k.len() == key.len() + 1 && k[..key.len()] == key[..] && k[key.len()] == logical);
+            if self.ds_direct || sticky { logical } else { 0 }
+        };
+        key.push(phys);
+        if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) {
+            if *LAZY_RO {
+                let (lro_d, lro_s) = (logical & 1 != 0, logical & 2 != 0);
+                let tex = d.tex;
+                if let Some(pi) = self.pass_info.as_mut() {
+                    let has_ds = pi.ds_format.is_some();
+                    if pi.ro_depth != (has_ds && lro_d) || pi.ro_stencil != (has_ds && lro_s) {
+                        pi.ro_depth = has_ds && lro_d;
+                        pi.ro_stencil = has_ds && lro_s;
+                        self.pdirty = true;
+                        self.last_pl = None;
+                        if logical == 0 && has_ds { self.mark_depth_dirty(tex); }
+                    }
+                }
+            }
+            return true;
+        }
         self.end_pass();
         let mut colors: Vec<Option<(TextureView, TextureFormat)>> = Vec::new();
         let mut samples = 1;
@@ -1872,10 +1899,11 @@ impl Gpu {
         let ds = self.s.ds.clone();
         let mut ds_att = None;
         let mut ds_format = None;
-        let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
+        let (ro_d, ro_s) = (phys & 1 != 0, phys & 2 != 0);
+        let (lro_d, lro_s) = (logical & 1 != 0, logical & 2 != 0);
         if ds.tex != 0 && self.tex(ds.tex).is_some() {
             if let Some((v, f)) = self.target_view(ds.tex, 0, ds.mip, ds.slice) {
-                if !ro_d && !ro_s { self.mark_depth_dirty(ds.tex); }
+                if !lro_d && !lro_s { self.mark_depth_dirty(ds.tex); }
                 let t = self.tex(ds.tex).unwrap();
                 ds_format = Some(f);
                 samples = t.desc.samples;
@@ -1931,7 +1959,7 @@ impl Gpu {
         self.pdirty = true;
         self.pass_info = Some(PassInfo {
             rt_formats: colors.iter().map(|c| c.as_ref().map(|x| x.1)).collect(),
-            samples, ds_format, ro_depth: ds_att.is_some() && ro_d, ro_stencil: ds_att.is_some() && ro_s, width: pw, height: ph,
+            samples, ds_format, ro_depth: ds_att.is_some() && lro_d, ro_stencil: ds_att.is_some() && lro_s, width: pw, height: ph,
         });
         self.pass_st = PassSt::default();
         self.begin_occlusion_in_pass();
@@ -2162,6 +2190,7 @@ impl Gpu {
                     self.last_pl = None;
                 }
             }
+            if is_depth(tformat) && b.sample == Sample::Depth && res == self.s.ds.tex { self.ds_direct = true; }
             if is_depth(tformat) && b.sample != Sample::Depth {
                 self.depth_proxy(res, b.sample == Sample::Uint);
             } else if !is_depth(tformat) && b.sample == Sample::Depth {
@@ -2664,6 +2693,7 @@ impl Gpu {
             (programs[0].clone(), Some(programs[1].clone()))
         } else { (vs, ps) };
         let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip(); return } };
+        self.ds_direct = false;
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps { self.prepare_depth_proxies(p, 1); }
         if !self.ensure_pass() { self.skip(); return; }
