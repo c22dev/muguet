@@ -782,6 +782,8 @@ enum QOp {
     Present(SurfaceTexture),
     MapRead(Buffer, Arc<AtomicBool>),
     OnDone(Box<dyn FnOnce() + Send>),
+    DestroyTexture(Texture),
+    DestroyBuffer(Buffer),
 }
 
 #[derive(Default)]
@@ -817,6 +819,8 @@ fn run_qop(queue: &Queue, done: &Submitted, op: QOp) {
         }
         QOp::MapRead(b, flag) => b.slice(..).map_async(MapMode::Read, move |r| { if r.is_err() { log("map failed"); } flag.store(true, Ordering::SeqCst); }),
         QOp::OnDone(f) => queue.on_submitted_work_done(f),
+        QOp::DestroyTexture(t) => t.destroy(),
+        QOp::DestroyBuffer(b) => b.destroy(),
     }
 }
 
@@ -1177,7 +1181,8 @@ impl Gpu {
     fn submitted_index(&self, seq: u64) -> Option<SubmissionIndex> {
         let mut s = self.submitted.state.lock().unwrap();
         while s.seq < seq { s = self.submitted.cv.wait(s).unwrap(); }
-        s.indices.iter().find(|(q, _)| *q == seq).map(|(_, i)| i.clone())
+        // submissions run in order, so an older one that fell out of the history is covered by the oldest kept
+        s.indices.iter().find(|(q, _)| *q >= seq).map(|(_, i)| i.clone())
     }
     /// Waits until every queued submit has reached the GPU queue.
     fn sync(&self) {
@@ -1406,8 +1411,8 @@ impl Gpu {
         if self.used(id) { self.flush(); }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
             match *o {
-                Obj::Tex(t) => { self.bc_live.remove(&id); t.tex.destroy(); }
-                Obj::Buf(b) => { if let Some(g) = b.gpu { g.destroy(); } }
+                Obj::Tex(t) => { self.bc_live.remove(&id); self.q(QOp::DestroyTexture(t.tex)); }
+                Obj::Buf(b) => { if let Some(g) = b.gpu { self.q(QOp::DestroyBuffer(g)); } }
                 Obj::Query(q) => { self.live_queries.remove(&q.addr); }
                 _ => {}
             }
@@ -3528,6 +3533,10 @@ impl Gpu {
             self.end_pass();
             if self.surface_size != (w, h) {
                 self.sync();
+                if self.qtx.is_some() {
+                    let mut s = self.submitted.state.lock().unwrap();
+                    while s.presented < self.presents_sent { s = self.submitted.cv.wait(s).unwrap(); }
+                }
                 let (surface, window) = self.surface.as_ref().unwrap();
                 let caps = surface.get_capabilities(&self.adapter);
                 surface.configure(&self.device, &SurfaceConfiguration {
