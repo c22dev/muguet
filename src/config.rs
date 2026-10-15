@@ -144,6 +144,8 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     if flag("fullscreen") { set_default("MUGUET_FULLSCREEN", "1"); }
     if flag("mute") { set_default("MUGUET_MUTE", "1"); }
     if flag("show_fps") { set_default("MUGUET_SHOW_FPS", "1"); }
+    // read once when the GPU starts; an environment override still wins
+    if let Some(v) = num("gpu_threads") { set_default("MUGUET_GPU_THREADS", (v as i64).to_string()); }
 
     let text = |k: &str| cfg.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
     if flag("multiplayer") {
