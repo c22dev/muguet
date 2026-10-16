@@ -96,6 +96,69 @@ struct Fmt {
 static BC_SOFT: AtomicBool = AtomicBool::new(false);
 static BC1_ASTC: AtomicBool = AtomicBool::new(false);
 static F32_HALF: AtomicBool = AtomicBool::new(false);
+/// MUGUET_LIVE_MAPS=0: don't sync WRITE_NO_OVERWRITE mapped buffers from the game's shadow before draws.
+static LIVE_MAPS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_LIVE_MAPS").map_or(true, |v| v != "0"));
+const LIVE_BLOCK: usize = 4096;
+/// Buffers above this are synced only in a window after the last upload (ring-style use).
+const LIVE_FULL_MAX: usize = 4 << 20;
+const LIVE_WINDOW: usize = 2 << 20;
+const MAP_WRITE_NO_OVERWRITE: u32 = 5;
+
+/// The port's D3D11 layer, seen from hooks on the game thread. A WRITE_NO_OVERWRITE Map returns a
+/// persistent per-buffer shadow; the game writes into it, sometimes for many frames, and the port
+/// copies the dirty range to the ring only at Unmap. On PC that memory is GPU-visible, so a draw
+/// sees the writes at once; here it would read what the GPU had at the last Unmap. So we remember
+/// each shadow and let a draw pick up what the game has written since (`Gpu::sync_live`).
+#[derive(Default)]
+pub struct D3dMaps {
+    /// resource -> ring buffer id, once known
+    res_to_id: HashMap<u64, u32>,
+    /// resource -> (shadow pointer, map type) of its current Map
+    by_res: HashMap<u64, (u64, u32)>,
+    /// every shadow pointer a Map ever returned -> (resource, latest map type)
+    shadows: HashMap<u64, (u64, u32)>,
+    /// id -> shadow pointer of every buffer that was ever mapped WRITE_NO_OVERWRITE
+    live: HashMap<u32, u64>,
+    /// uploads matched against the shadows so far, for ids whose resource is still unknown
+    tries: HashMap<u32, u32>,
+}
+static D3D: LazyLock<Mutex<D3dMaps>> = LazyLock::new(|| Mutex::new(D3dMaps::default()));
+thread_local! { static UNMAPPING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+/// `wasm_null_d3d::GpuUploadBuffer(id, offset, data, size, mode)`: when called from Unmap, it tells
+/// which ring id the resource being unmapped uploads to. (The function is partly inlined, so not
+/// every upload comes through here; `learn_shadow` covers the rest.)
+pub fn d3d_upload(id: u32, _offset: u64, _data: u64, _size: u64) {
+    let res = UNMAPPING.with(|u| u.replace(0));
+    if res == 0 { return; }
+    let mut d = D3D.lock().unwrap();
+    // Map sees the resource through another interface pointer than Unmap (a small constant offset)
+    let key = if d.by_res.contains_key(&res) { Some(res) } else { d.by_res.keys().copied().filter(|&k| k > res && k - res < 0x200).min() };
+    if let Some(key) = key {
+        d.res_to_id.insert(key, id);
+        if let Some((p, ty)) = d.by_res.get(&key).copied() {
+            if ty == MAP_WRITE_NO_OVERWRITE && p != 0 { d.live.insert(id, p); }
+        }
+    }
+}
+/// `NullContext::Map` returned: `mapped` points at the D3D11_MAPPED_SUBRESOURCE it filled.
+pub fn d3d_map(mem: &SharedMemory, res: u64, ty: u32, mapped: u64) {
+    let (base, len) = mem_base_len(mem);
+    let p = mapped as usize;
+    let pdata = if p + 8 <= len { unsafe { std::ptr::read_unaligned(base.add(p) as *const u64) } } else { 0 };
+    if pdata == 0 { return; }
+    let mut d = D3D.lock().unwrap();
+    d.by_res.insert(res, (pdata, ty));
+    d.shadows.insert(pdata, (res, ty));
+    if ty == MAP_WRITE_NO_OVERWRITE {
+        if let Some(id) = d.res_to_id.get(&res).copied() { d.live.insert(id, pdata); }
+    }
+}
+pub fn d3d_unmap(res: u64) {
+    D3D.lock().unwrap().by_res.remove(&res);
+    UNMAPPING.with(|u| u.set(res));
+}
+
 static MEM_STATS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_MEM_STATS").is_ok_and(|v| v != "0"));
 static RE_VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@binding\((\d+)u?\)\s*var(?:<[^>]*>)?\s+(\w+)").unwrap());
 static RE_IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
@@ -587,7 +650,11 @@ struct Buf {
     enc: u64,
     in_bg: bool,
     counter: Option<Buffer>,
+    /// end of the last upload the game made, for the sync window of large ring buffers
+    upload_end: u64,
 }
+/// Our copy of a WRITE_NO_OVERWRITE mapped buffer's shadow, as last uploaded.
+struct LiveBuf { ptr: u64, mirror: Vec<u8>, frame: u64 }
 #[derive(Clone, Copy)]
 struct SigEl { sem: u32, idx: u32, reg: u32 }
 struct ShaderObj {
@@ -849,6 +916,9 @@ pub struct Gpu {
     frame_slot_done: Vec<Option<SubmissionIndex>>,
     last_submit: Option<SubmissionIndex>,
     vb_avail: [u64; 16],
+    live: HashMap<u32, LiveBuf>,
+    live_synced: u64,
+    live_blocks: u64,
     dbg_idx: u64,
 
     draws: u64,
@@ -984,7 +1054,7 @@ impl Gpu {
             proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
-            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
+            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16], live: HashMap::new(), live_synced: 0, live_blocks: 0,
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0, errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
@@ -1303,7 +1373,67 @@ impl Gpu {
         self.end_pass();
     }
 
+    /// The port's GpuUploadBuffer is partly inlined, so not every upload tells us its resource:
+    /// match an upload's bytes against the shadows the Map hook has seen to learn which shadow
+    /// backs buffer `id`.
+    fn learn_shadow(&mut self, id: u32, offset: u64, data: &[u8]) {
+        let mut d = D3D.lock().unwrap();
+        if d.live.contains_key(&id) { return; }
+        let tries = d.tries.entry(id).or_insert(0);
+        if *tries >= 40 { return; }
+        *tries += 1;
+        if data.iter().all(|&b| b == 0) { return; }
+        let (base, len) = mem_base_len(&self.mem);
+        let found = d.shadows.iter().find(|(&ptr, _)| {
+            let at = ptr as usize + offset as usize;
+            at + data.len() <= len && unsafe { std::slice::from_raw_parts(base.add(at), data.len()) } == data
+        }).map(|(&ptr, &(res, ty))| (ptr, res, ty));
+        if let Some((ptr, res, ty)) = found {
+            d.res_to_id.insert(res, id);
+            if ty == MAP_WRITE_NO_OVERWRITE { d.live.insert(id, ptr); }
+        }
+    }
+    /// Uploads what the game has written into a no-overwrite mapped buffer's shadow since we last
+    /// looked, so this draw sees it even though the port copies it to the ring only at Unmap.
+    fn sync_live(&mut self, id: u32) {
+        if id == 0 { return; }
+        let frame = self.presents;
+        if self.live.get(&id).is_some_and(|l| l.frame == frame) { return; }
+        let Some((g, bytes, upload_end)) = self.buf(id).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes as usize, b.upload_end as usize))) else { return };
+        let (base, len) = mem_base_len(&self.mem);
+        if !self.live.contains_key(&id) {
+            let Some(ptr) = D3D.lock().unwrap().live.get(&id).copied() else { return };
+            let p = ptr as usize;
+            if p == 0 || p + bytes > len { return; }
+            // our GPU copy may already lag the shadow: start from the shadow's content
+            let mirror = unsafe { std::slice::from_raw_parts(base.add(p), bytes) }.to_vec();
+            self.queue.write_buffer(&g, 0, &mirror);
+            self.live.insert(id, LiveBuf { ptr, mirror, frame });
+            return;
+        }
+        let l = self.live.get_mut(&id).unwrap();
+        l.frame = frame;
+        let p = l.ptr as usize;
+        if p + bytes > len { return; }
+        let shadow = unsafe { std::slice::from_raw_parts(base.add(p), bytes) };
+        let (lo, hi) = if bytes <= LIVE_FULL_MAX { (0, bytes) } else { (upload_end.saturating_sub(LIVE_BLOCK), (upload_end + LIVE_WINDOW).min(bytes)) };
+        let mut writes: Vec<(usize, usize)> = Vec::new();
+        let mut b = lo / LIVE_BLOCK * LIVE_BLOCK;
+        while b < hi {
+            let e = (b + LIVE_BLOCK).min(bytes);
+            if shadow[b..e] != l.mirror[b..e] {
+                l.mirror[b..e].copy_from_slice(&shadow[b..e]);
+                match writes.last_mut() { Some(w) if w.1 == b => w.1 = e, _ => writes.push((b, e)) }
+            }
+            b = e;
+        }
+        let datas: Vec<(usize, Vec<u8>)> = writes.iter().map(|&(a, e)| (a, l.mirror[a..((e + 3) & !3).min(bytes)].to_vec())).collect();
+        self.live_synced += 1;
+        self.live_blocks += writes.len() as u64;
+        for (a, data) in datas { self.queue.write_buffer(&g, a as u64, &data); }
+    }
     fn destroy(&mut self, id: u32) {
+        if self.live.remove(&id).is_some() { D3D.lock().unwrap().live.remove(&id); }
         if self.astc_pending.contains(&id) { self.flush_astc(); }
         self.pending_clears.remove(&id);
         if self.is_bound(id) { self.pdirty = true; }
@@ -1384,7 +1514,7 @@ impl Gpu {
 
     fn create_buffer(&mut self, id: u32, size: u32, bind: u32, misc: u32, stride: u32) {
         let size = size as u64;
-        let mut b = Buf { size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None };
+        let mut b = Buf { size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None, upload_end: 0 };
         if bind & 4 != 0 { b.shadow = Some(vec![0u8; size as usize]); }
         let mut usage = BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         if bind & 1 != 0 { usage |= BufferUsages::VERTEX; }
@@ -1400,8 +1530,10 @@ impl Gpu {
 
     fn upload_buffer(&mut self, id: u32, offset: u64, size: u64, data_addr: u64, no_overwrite: bool) {
         let data = self.bytes(data_addr, size).to_vec();
+        if *LIVE_MAPS && no_overwrite && size >= 64 && !self.live.contains_key(&id) { self.learn_shadow(id, offset, &data); }
         let used = self.used(id);
         let Some(b) = self.buf_mut(id) else { return };
+        b.upload_end = offset + size;
         if let Some(sh) = b.shadow.as_mut() {
             let end = ((offset + size) as usize).min(sh.len());
             if (offset as usize) < end { sh[offset as usize..end].copy_from_slice(&data[..end - offset as usize]); }
@@ -2696,6 +2828,10 @@ impl Gpu {
         let v_first = if indexed || fold_v { 0 } else { start };
         let i_first = if fold_i { 0 } else { start_instance };
 
+        if *LIVE_MAPS {
+            for &(slot, _) in &layout.slots { let id = self.s.vb[slot as usize].buf; self.sync_live(id); }
+            if indexed { self.sync_live(self.s.ib.0); }
+        }
         let mut vb_binds: Vec<(u32, Buffer, u64, u64)> = Vec::new();
         for &(slot, cls) in &layout.slots {
             let vb = self.s.vb[slot as usize].clone();
@@ -3497,6 +3633,10 @@ impl Gpu {
                 frames as f64 / dt, crate::footprint_mb(), crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0), crate::gpu_allocated_mb(), crate::compressed_mb(), frames, self.clears_folded, (self.draws - self.fps_d0) / frames.max(1), self.pending_skips - self.pending_skips0, (self.submits - self.submits0) as f64 / frames.max(1) as f64,
                 (self.passes - self.passes0) as f64 / frames.max(1) as f64, self.skipped, self.pipe_creates, self.bind_groups.len(), self.errors.load(Ordering::Relaxed)
             ));
+            if self.live_synced > 0 {
+                log(&format!("live maps: {} buffers, {} syncs, {} blocks uploaded early", self.live.len(), self.live_synced, self.live_blocks));
+                self.live_synced = 0; self.live_blocks = 0;
+            }
             if *MEM_STATS {
                 let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();
                 for (f, p, e) in self.bc_live.values() {
