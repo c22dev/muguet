@@ -23,6 +23,12 @@ enum Arg {
     OpusFrame,
 
     ResourceMap,
+    /// First arg only: wraps the body; the host gets the function's i32 result (then the listed
+    /// locals) and returns the value to use.
+    ExitI32,
+    /// Any local by index: an i64 (pointer / i64 param), or an i32 param sign-extended.
+    L64(u32),
+    L32(u32),
 }
 
 const HOOKS: &[(&str, &str, &[Arg])] = &[
@@ -35,15 +41,19 @@ const HOOKS: &[(&str, &str, &[Arg])] = &[
     ("muguet_cash", "stats_commands::CommandStatSetInt(int, int, bool)", &[Arg::CashWrite, Arg::CashWrite]),
     ("muguet_opus_frame", "opus_decode_frame", &[Arg::OpusFrame; 6]),
     ("muguet_resource_map", "rage::datResourceInfo::GenerateMap(rage::datResourceMap&) const", &[Arg::ResourceMap]),
+    // the port's D3D11 layer: where mapped buffers live, and which ring id a resource uploads to
+    ("muguet_gpu_upload", "wasm_null_d3d::GpuUploadBuffer(unsigned int, unsigned long, void const*, unsigned long, unsigned int)", &[Arg::L32(0), Arg::L64(1), Arg::L64(2), Arg::L64(3), Arg::L32(4)]),
+    ("muguet_d3d_map", "wasm_null_d3d::NullContext::Map(ID3D11Resource*, unsigned int, D3D11_MAP, unsigned int, D3D11_MAPPED_SUBRESOURCE*)", &[Arg::ExitI32, Arg::L64(1), Arg::L32(2), Arg::L32(3), Arg::L64(5)]),
+    ("muguet_d3d_unmap", "wasm_null_d3d::NullContext::Unmap(ID3D11Resource*, unsigned int)", &[Arg::L64(1), Arg::L32(2)]),
 ];
 
 const SCENARIO_CHECK: &str = "CScenarioManager::PerformCollisionChecksForScenarioPoint(CScenarioManager::CollisionCheckParams const&)";
 const MOVIE_PRELOAD: &str = "CMovieMgr::PreloadMovie(char const*, bool)";
 
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 fn returns(args: &[Arg]) -> bool {
-    args.contains(&Arg::Local1Replaced) || args.contains(&Arg::MissingText) || args.contains(&Arg::TxdLoaded) || args.contains(&Arg::PoolGrow) || args.contains(&Arg::CashWrite) || args.contains(&Arg::OpusFrame)
+    args.contains(&Arg::ExitI32) || args.contains(&Arg::Local1Replaced) || args.contains(&Arg::MissingText) || args.contains(&Arg::TxdLoaded) || args.contains(&Arg::PoolGrow) || args.contains(&Arg::CashWrite) || args.contains(&Arg::OpusFrame)
 }
 
 struct Patcher {
@@ -128,6 +138,36 @@ impl Reencode for Patcher {
         let mut f = self.new_function_with_parsed_locals(&func)?;
         use wasm_encoder::Instruction as I;
         let call = I::Call(self.imported_funcs + hook as u32);
+        if HOOKS[hook].2.first() == Some(&Arg::ExitI32) {
+            // block (result i32) { body, with `return` as a branch out of the block } -> host(result, locals...) -> return
+            f.instruction(&I::Block(wasm_encoder::BlockType::Result(wasm_encoder::ValType::I32)));
+            let mut depth = 0u32;
+            let mut reader = func.get_operators_reader()?;
+            while !reader.eof() {
+                let i = self.parse_instruction(&mut reader)?;
+                match &i {
+                    I::Block(_) | I::Loop(_) | I::If(_) => { depth += 1; f.instruction(&i); }
+                    I::End if depth == 0 => {
+                        f.instruction(&I::End);
+                        f.instruction(&I::I64ExtendI32U);
+                        for arg in &HOOKS[hook].2[1..] {
+                            match arg {
+                                Arg::L64(k) => { f.instruction(&I::LocalGet(*k)); }
+                                Arg::L32(k) => { f.instruction(&I::LocalGet(*k)).instruction(&I::I64ExtendI32S); }
+                                _ => unreachable!(),
+                            }
+                        }
+                        f.instruction(&call).instruction(&I::I32WrapI64);
+                        f.instruction(&I::End);
+                    }
+                    I::End => { depth -= 1; f.instruction(&i); }
+                    I::Return => { f.instruction(&I::Br(depth)); }
+                    _ => { f.instruction(&i); }
+                }
+            }
+            code.function(&f);
+            return Ok(());
+        }
         if HOOKS[hook].2 == [Arg::ResourceMap] {
             let mut reader = func.get_operators_reader()?;
             let mut body = Vec::new();
@@ -195,7 +235,9 @@ impl Reencode for Patcher {
                     Arg::Local0 => f.instruction(&I::LocalGet(0)),
                     Arg::TlsBase => f.instruction(&I::GlobalGet(self.tls_global)),
                     Arg::Local1Replaced => f.instruction(&I::LocalGet(1)).instruction(&I::I64ExtendI32U),
-                    Arg::MissingText | Arg::TxdLoaded | Arg::PoolGrow | Arg::CashWrite | Arg::OpusFrame | Arg::ResourceMap => unreachable!(),
+                    Arg::L64(k) => f.instruction(&I::LocalGet(*k)),
+                    Arg::L32(k) => f.instruction(&I::LocalGet(*k)).instruction(&I::I64ExtendI32S),
+                    Arg::ExitI32 | Arg::MissingText | Arg::TxdLoaded | Arg::PoolGrow | Arg::CashWrite | Arg::OpusFrame | Arg::ResourceMap => unreachable!(),
                 };
             }
             f.instruction(&call);
