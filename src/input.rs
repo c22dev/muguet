@@ -177,6 +177,9 @@ pub fn mouse_pos(x: i32, y: i32) {
 }
 
 static SENS: LazyLock<f64> = LazyLock::new(|| std::env::var("MUGUET_MOUSE_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0));
+pub fn look_sens() -> f64 {
+    std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0).unwrap_or(1.0).min(20.0)
+}
 static FRAC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
 pub fn mouse_delta_f(dx: f64, dy: f64) {

@@ -188,7 +188,6 @@ const LOOK_GAIN: f64 = 3.0;
 const WHEEL_DEADZONE: f64 = 10.0;
 const WHEEL_FULL: f64 = 45.0;
 const WHEEL_PUSH: f64 = 40.0;
-static TOUCH_SENS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
 
 const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
 const ROOF_HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -610,7 +609,7 @@ impl Overlay {
                         *last = p;
 
                         let speed = (dx * dx + dy * dy).sqrt();
-                        let gain = LOOK_GAIN * *TOUCH_SENS * (1.0 + (speed / 12.0).min(1.5));
+                        let gain = LOOK_GAIN * input::look_sens() * (1.0 + (speed / 12.0).min(1.5));
                         input::mouse_delta_f(dx * gain, dy * gain);
                     }
                     None => {}
