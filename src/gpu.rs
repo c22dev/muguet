@@ -96,6 +96,8 @@ struct Fmt {
 static BC_SOFT: AtomicBool = AtomicBool::new(false);
 static BC1_ASTC: AtomicBool = AtomicBool::new(false);
 static F32_HALF: AtomicBool = AtomicBool::new(false);
+/// MUGUET_CLOUD_SHADOWS=0 skips the dedicated cloud-shadow draw (debug).
+static CLOUD_SHADOWS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_CLOUD_SHADOWS").map_or(true, |v| v != "0"));
 static MEM_STATS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_MEM_STATS").is_ok_and(|v| v != "0"));
 static RE_VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@binding\((\d+)u?\)\s*var(?:<[^>]*>)?\s+(\w+)").unwrap());
 static RE_IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
@@ -826,6 +828,11 @@ pub struct Gpu {
     proxy_pipelines: HashMap<&'static str, RenderPipeline>,
     unfilt: HashMap<u64, (u128, u128)>,
     nearest: HashMap<u32, Sampler>,
+    /// The 128x1 ramp `cascadeshadows_rendering::PS_SmoothStep` last rendered, and a view of it.
+    ramp_tex: u32,
+    ramp_view: Option<(u32, TextureView)>,
+    /// 1x1 white texture: density 1 = clear sky for CloudSampler.
+    white_view: Option<TextureView>,
     f2d_pipeline: Option<RenderPipeline>,
     bc1_astc: Option<ComputePipeline>,
     astc_jobs: Vec<AstcJob>,
@@ -981,7 +988,7 @@ impl Gpu {
             bgl_cache: FxHashMap::default(), empty_bgl: None, pipelines: FxHashMap::default(), compute: HashMap::new(), bind_groups: FxHashMap::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
-            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
+            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), ramp_tex: 0, ramp_view: None, white_view: None, f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
@@ -1304,6 +1311,7 @@ impl Gpu {
     }
 
     fn destroy(&mut self, id: u32) {
+        if id == self.ramp_tex { self.ramp_tex = 0; self.ramp_view = None; }
         if self.astc_pending.contains(&id) { self.flush_astc(); }
         self.pending_clears.remove(&id);
         if self.is_bound(id) { self.pdirty = true; }
@@ -2294,6 +2302,25 @@ impl Gpu {
         Some((ci, off))
     }
 
+    fn white_texture(&mut self) -> TextureView {
+        if let Some(v) = &self.white_view { return v.clone(); }
+        let tex = self.device.create_texture(&TextureDescriptor {
+            label: Some("white"), size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2, format: TextureFormat::Rgba8Unorm, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST, view_formats: &[],
+        });
+        self.queue.write_texture(TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All }, &[255, 255, 255, 255], TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None }, Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+        let v = tex.create_view(&TextureViewDescriptor::default());
+        self.white_view = Some(v.clone());
+        v
+    }
+    fn ramp_view(&mut self) -> Option<TextureView> {
+        if let Some((id, v)) = &self.ramp_view { if *id == self.ramp_tex { return Some(v.clone()); } }
+        let t = self.tex(self.ramp_tex)?;
+        if t.desc.w != 128 || t.desc.h != 1 { return None; }
+        let v = t.tex.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2), ..Default::default() });
+        self.ramp_view = Some((self.ramp_tex, v.clone()));
+        Some(v)
+    }
     fn dummy_texture(&mut self, b: &Binding) -> TextureView {
         let key = format!("{:?}|{:?}|{}", b.dim, b.sample, b.ms);
         if let Some(v) = self.dummy_tex.get(&key) { return v.clone(); }
@@ -2335,6 +2362,15 @@ impl Gpu {
         let mut key: Vec<u64> = Vec::with_capacity(bindings.len() * 2 + 3);
         key.extend([bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
+        // The cloud-shadow programs of cascadeshadows_rendering read CloudSampler (t5) and
+        // SmoothStepSampler (t6), but the game never binds either here: the slots keep whatever
+        // the last material and the tiled-lighting depth downsample left in them, so the "cloud
+        // factor" becomes the depth of one screen tile and the ground flashes dark (#42). Give the
+        // draw the ramp it just rendered and a clear-sky (white) cloud texture instead.
+        let cloud_fix = stage == 1 && prog.label.starts_with("cascadeshadows_rendering") && (prog.label.contains("CloudShadows") || prog.label.contains("CLOUDS")) && self.ramp_tex != 0 && {
+            let id = *self.s.srv[1].get(6).unwrap_or(&0);
+            self.view_obj(id).filter(|v| !v.is_buf).and_then(|v| self.tex(v.res)).map(|t| (t.desc.w, t.desc.h)) != Some((128, 1))
+        };
         for b in bindings {
             match b.kind {
                 Kind::Uniform => {
@@ -2375,6 +2411,24 @@ impl Gpu {
                     entries.push((b.binding, Res::Smp(s)));
                 }
                 Kind::Texture => {
+                    if cloud_fix && b.binding == 38 {
+                        if let Some(v) = self.ramp_view() {
+                            let r = self.ramp_tex;
+                            self.use_tex(r);
+                            if let Some(t) = self.tex_mut(r) { t.in_bg = true; }
+                            key.push(r as u64 | 1 << 41);
+                            key.push(0);
+                            entries.push((b.binding, Res::View(v)));
+                            continue;
+                        }
+                    }
+                    if cloud_fix && b.binding == 37 {
+                        key.push(1 << 42);
+                        key.push(0);
+                        let d = self.white_texture();
+                        entries.push((b.binding, Res::View(d)));
+                        continue;
+                    }
                     let id = *self.s.srv[stage].get((b.binding as usize).wrapping_sub(32)).unwrap_or(&0);
                     let is_tex = self.view_obj(id).map(|v| !v.is_buf).unwrap_or(false);
                     if is_tex { if let Some(r) = self.view_obj(id).map(|v| v.res) { if self.pending_clears.contains_key(&r) { self.materialize_clears(r); } } }
@@ -2636,6 +2690,8 @@ impl Gpu {
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id) else { self.skip(); return };
         let ps = if ps_id != 0 { match self.shader_program(ps_id) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        if let Some(p) = &ps { if p.label.ends_with("::PS_SmoothStep") && self.s.rt[0].tex != 0 { self.ramp_tex = self.s.rt[0].tex; } }
+        if !*CLOUD_SHADOWS && ps.as_ref().is_some_and(|p| p.label.starts_with("cascadeshadows_rendering") && p.label.contains("CloudShadows")) { self.skip(); return; }
         // Pause-map fog tiles use world coordinates and the original depth
         // program. Keep their programs separate from the normalized HUD mask.
         let pause = vs.label == "im::VS_Blit"
