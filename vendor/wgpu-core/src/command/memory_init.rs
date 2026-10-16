@@ -40,6 +40,12 @@ pub(crate) struct CommandBufferTextureMemoryActions {
 }
 
 impl CommandBufferTextureMemoryActions {
+    /// Whether a surface of `texture` is in the discard list (a later load
+    /// of it would need a clear first).
+    pub(crate) fn has_discard_on(&self, texture: &Arc<Texture>) -> bool {
+        self.discards.iter().any(|d| d.texture.is_equal(texture))
+    }
+
     pub(crate) fn drain_init_actions(&mut self) -> Drain<'_, TextureInitTrackerAction> {
         self.init_actions.drain(..)
     }

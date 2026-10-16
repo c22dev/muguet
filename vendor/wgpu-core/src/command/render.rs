@@ -2285,6 +2285,11 @@ impl Global {
     }
 }
 
+/// Encode Metal render passes into the open command buffer when no pre-pass is
+/// needed (`MUGUET_MERGE_CB=0` turns this off).
+static MERGE_COMMAND_BUFFERS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("MUGUET_MERGE_CB").map_or(true, |v| v != "0"));
+
 pub(super) fn encode_render_pass(
     parent_state: &mut EncodingState<InnerCommandEncoder>,
     mut base: BasePass<ArcRenderCommand, Infallible>,
@@ -2305,14 +2310,42 @@ pub(super) fn encode_render_pass(
     // We automatically keep extending command buffers over time, and because
     // we want to insert a command buffer _before_ what we're about to record,
     // we need to make sure to close the previous one.
-    parent_state
-        .raw_encoder
-        .close_if_open()
-        .map_pass_err(pass_scope)?;
-    let raw_encoder = parent_state
-        .raw_encoder
-        .open_pass(base.label.as_deref())
-        .map_pass_err(pass_scope)?;
+    //
+    // On Metal (barriers and query resets are no-ops) the pass can instead go
+    // into the open command buffer when nothing has to run before it: no
+    // discarded attachment to clear and no indirect draws to validate.
+    let merge = device.backend() == wgt::Backend::Metal
+        && *MERGE_COMMAND_BUFFERS
+        && !color_attachments.iter().flatten().any(|at| {
+            parent_state
+                .texture_memory_actions
+                .has_discard_on(&at.view.parent)
+        })
+        && !depth_stencil_attachment.as_ref().is_some_and(|at| {
+            parent_state
+                .texture_memory_actions
+                .has_discard_on(&at.view.parent)
+        })
+        && !base.commands.iter().any(|c| {
+            matches!(
+                c,
+                ArcRenderCommand::DrawIndirect { .. }
+                    | ArcRenderCommand::MultiDrawIndirectCount { .. }
+                    | ArcRenderCommand::ExecuteBundle(_)
+            )
+        });
+    let raw_encoder = if merge {
+        parent_state.raw_encoder.open().map_pass_err(pass_scope)?
+    } else {
+        parent_state
+            .raw_encoder
+            .close_if_open()
+            .map_pass_err(pass_scope)?;
+        parent_state
+            .raw_encoder
+            .open_pass(base.label.as_deref())
+            .map_pass_err(pass_scope)?
+    };
 
     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
         let mut pending_query_resets = QueryResetMap::new();
@@ -2714,6 +2747,24 @@ pub(super) fn encode_render_pass(
         let trackers = state.pass.scope;
 
         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
+
+        if merge {
+            debug_assert!(
+                pending_discard_init_fixups.is_empty() && indirect_draw_validation_batcher.is_empty(),
+                "a merged render pass needed a pre-pass"
+            );
+            let raw = parent_state.raw_encoder.open().map_pass_err(pass_scope)?;
+            pending_query_resets
+                .reset_queries(raw, parent_state.snatch_guard)
+                .map_pass_err(pass_scope)?;
+            CommandEncoder::insert_barriers_from_scope(
+                raw,
+                parent_state.tracker,
+                &trackers,
+                parent_state.snatch_guard,
+            );
+            return Ok(());
+        }
 
         // Metal barriers are no-ops, so when nothing else needs to run before the
         // pass, update the trackers here instead of opening a separate command buffer.
