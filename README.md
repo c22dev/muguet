@@ -14,7 +14,7 @@ Because I care about me not getting sued, you will need your own copy as a `.zip
 
 It's basically the same source as the web port.
 
-Muguet itself will then asks for that zip
+Muguet itself will then ask for that zip
 
 ## Requirements
 - Apple Silicon Mac, macOS 14 or later
