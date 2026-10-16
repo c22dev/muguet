@@ -607,6 +607,9 @@ struct Program {
     variants: RefCell<HashMap<String, Option<ShaderModule>>>,
     label: String,
     uid: u64,
+    /// Same for every load of the same shader, so pipelines can be keyed and saved by content.
+    stable: u64,
+    hash: String,
     vid: bool,
     iid: bool,
     out_locs: Vec<u32>,
@@ -615,8 +618,18 @@ struct Program {
 }
 #[derive(Clone, Copy)]
 struct El { sem: u32, idx: u32, fmt: u32, slot: u32, offset: u32, cls: u32 }
-struct LayoutObj { els: Vec<El>, slots: Vec<(u32, u32)> }
-struct StateObj { words: Vec<u32>, sampler: Option<Sampler> }
+struct LayoutObj { els: Vec<El>, slots: Vec<(u32, u32)>, stable: u64 }
+struct StateObj { words: Vec<u32>, sampler: Option<Sampler>, stable: u64 }
+
+fn stable_hash<T: std::hash::Hash>(t: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    t.hash(&mut h);
+    h.finish()
+}
+fn layout_stable(els: &[El], slots: &[(u32, u32)]) -> u64 {
+    stable_hash(&(els.iter().map(|e| [e.sem, e.idx, e.fmt, e.slot, e.offset, e.cls]).collect::<Vec<_>>(), slots))
+}
 struct ViewObj {
     res: u32,
     is_buf: bool,
@@ -726,6 +739,27 @@ struct PipeJob {
 }
 enum PipeEntry { Pending, Done(Option<Rc<Pl>>) }
 
+/// The draw state a pipeline is built from, besides the shaders and pass.
+struct PipeStates { sig: Vec<SigEl>, rs: Option<Rc<StateObj>>, blend: Option<Rc<StateObj>>, dss: Option<Rc<StateObj>> }
+
+const RECIPE_LIMIT: u64 = 32 << 20;
+static PIPE_CACHE: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_PIPE_CACHE").map_or(true, |v| v != "0"));
+
+fn parse_format(name: &str) -> Option<TextureFormat> {
+    use TextureFormat as F;
+    const ALL: &[TextureFormat] = &[
+        F::R8Unorm, F::R8Snorm, F::R8Uint, F::R8Sint, F::R16Uint, F::R16Sint, F::R16Unorm, F::R16Snorm, F::R16Float,
+        F::Rg8Unorm, F::Rg8Snorm, F::Rg8Uint, F::Rg8Sint, F::R32Uint, F::R32Sint, F::R32Float,
+        F::Rg16Uint, F::Rg16Sint, F::Rg16Unorm, F::Rg16Snorm, F::Rg16Float,
+        F::Rgba8Unorm, F::Rgba8UnormSrgb, F::Rgba8Snorm, F::Rgba8Uint, F::Rgba8Sint, F::Bgra8Unorm, F::Bgra8UnormSrgb,
+        F::Rgb9e5Ufloat, F::Rgb10a2Uint, F::Rgb10a2Unorm, F::Rg11b10Ufloat,
+        F::Rg32Uint, F::Rg32Sint, F::Rg32Float, F::Rgba16Uint, F::Rgba16Sint, F::Rgba16Unorm, F::Rgba16Snorm, F::Rgba16Float,
+        F::Rgba32Uint, F::Rgba32Sint, F::Rgba32Float,
+        F::Stencil8, F::Depth16Unorm, F::Depth24Plus, F::Depth24PlusStencil8, F::Depth32Float, F::Depth32FloatStencil8,
+    ];
+    ALL.iter().copied().find(|f| format!("{f:?}") == name)
+}
+
 fn compile_pipeline(device: &Device, job: &PipeJob) -> Option<RenderPipeline> {
     let vbs: Vec<Option<VertexBufferLayout>> = job.vbs.iter().map(|v| v.as_ref().map(|(stride, step, attrs)| VertexBufferLayout { array_stride: *stride, step_mode: *step, attributes: attrs })).collect();
     let desc = RenderPipelineDescriptor {
@@ -799,6 +833,11 @@ pub struct Gpu {
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     map_programs: HashMap<String, Rc<Program>>,
+    warm: std::collections::VecDeque<serde_json::Value>,
+    warm_programs: HashMap<String, Option<Rc<Program>>>,
+    warmed: u64,
+    warm_t0: Option<Instant>,
+    recipe_bytes: u64,
     next_uid: u64,
     bgl_cache: FxHashMap<(u64, u128, u32, u32), (BindGroupLayout, u64)>,
     empty_bgl: Option<(BindGroupLayout, u64)>,
@@ -977,7 +1016,7 @@ impl Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
+            map_programs: HashMap::new(), warm: Default::default(), warm_programs: HashMap::new(), warmed: 0, warm_t0: None, recipe_bytes: 0, s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
             bgl_cache: FxHashMap::default(), empty_bgl: None, pipelines: FxHashMap::default(), compute: HashMap::new(), bind_groups: FxHashMap::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
@@ -1113,6 +1152,7 @@ impl Gpu {
     }
 
     fn run(&mut self) -> ! {
+        self.load_recipes();
         let mut tail = RING_DATA as i32;
         self.hdr(1).store(tail, Ordering::SeqCst);
         self.hdr(2).store(1, Ordering::SeqCst);
@@ -1137,7 +1177,11 @@ impl Gpu {
                     self.hdr(5).store(0, Ordering::SeqCst);
                     continue;
                 }
-                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 { 100 } else { 1 };
+                if !self.warm.is_empty() {
+                    self.warm_step(Duration::from_millis(3));
+                    while let Ok((done, pipeline)) = self.pipe_results.try_recv() { self.finish_pipeline(done, pipeline); }
+                }
+                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 && self.warm.is_empty() { 100 } else { 1 };
                 let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(Duration::from_millis(timeout)));
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
@@ -1584,7 +1628,8 @@ impl Gpu {
                 slots.push((e.slot, e.cls));
             }
         }
-        self.set_obj(id, Obj::Layout(Rc::new(LayoutObj { els, slots })));
+        let stable = layout_stable(&els, &slots);
+        self.set_obj(id, Obj::Layout(Rc::new(LayoutObj { els, slots, stable })));
     }
 
     fn create_state(&mut self, p: u64, n: u64) {
@@ -1592,7 +1637,8 @@ impl Gpu {
         let kind = self.u(p + 1);
         let words: Vec<u32> = (2..n).map(|i| self.u(p + i)).collect();
         let sampler = if kind == 3 { Some(self.make_sampler(&words)) } else { None };
-        self.set_obj(id, Obj::State(Rc::new(StateObj { words, sampler })));
+        let stable = stable_hash(&words);
+        self.set_obj(id, Obj::State(Rc::new(StateObj { words, sampler, stable })));
     }
 
     fn make_sampler(&self, w: &[u32]) -> Sampler {
@@ -1638,7 +1684,8 @@ impl Gpu {
             }
             _ => return None,
         };
-        let prog = self.load_program(&hash, stage);
+        // one Program per shader, shared by every object that uses it and by the pipeline warm-up
+        let prog = self.warm_program(&hash, stage);
         if let Some(Obj::Shader(s)) = self.obj_mut(id) { s.program = Some(prog.clone()); }
         prog
     }
@@ -1694,7 +1741,8 @@ impl Gpu {
         let out_locs = if stage == 0 { locations_in(&text, true) } else { vec![] };
         let in_locs = if stage == 1 { locations_in(&text, false) } else { vec![] };
         let clip = text.contains("@builtin(clip_distances)");
-        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, vid, iid, out_locs, in_locs, clip }))
+        let stable = stable_hash(&(hash, stage, pause));
+        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, stable, hash: if pause { String::new() } else { hash.to_string() }, vid, iid, out_locs, in_locs, clip }))
     }
 
     fn variant(&self, prog: &Program, key: &str, make: impl FnOnce(&str) -> String) -> Option<ShaderModule> {
@@ -2481,26 +2529,39 @@ impl Gpu {
         let pi = self.pass_info.clone()?;
         let (topo, strip) = topology(self.s.topo);
         let strip_fmt = if strip && self.s.ib.0 != 0 { Some(if self.s.ib.1 == 57 { IndexFormat::Uint16 } else { IndexFormat::Uint32 }) } else { None };
-        let mut key: Vec<i64> = vec![vs.uid as i64, ps.map(|p| p.uid as i64).unwrap_or(0), self.s.layout as i64];
-        for p in std::iter::once(vs).chain(ps) {
-            if let Some(m) = self.unfilt.get(&p.uid) { key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]); }
-        }
         let strides: Vec<u32> = (0..16).map(|i| { let v = &self.s.vb[i]; if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) { v.stride } else { 0 } }).collect();
-        for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
-        key.extend([self.s.topo as i64, match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 }, self.s.blend.0 as i64, self.s.dss.0 as i64, self.s.rs as i64]);
-        for f in &pi.rt_formats { key.push(f.map(|f| format_id(f)).unwrap_or(-1)); }
-        key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
+        let st = PipeStates {
+            sig: self.vs_sig()?,
+            rs: if self.s.rs != 0 { self.state(self.s.rs) } else { None },
+            blend: if self.s.blend.0 != 0 { self.state(self.s.blend.0) } else { None },
+            dss: if self.s.dss.0 != 0 { self.state(self.s.dss.0) } else { None },
+        };
+        let strip_code = match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 };
+        let key = self.pipe_key(vs, ps, layout, &strides, self.s.topo, strip_code, &st, &pi);
         let _ = (vs_id, ps_id);
         match self.pipelines.get(&key) {
             Some(PipeEntry::Done(p)) => return p.clone(),
-            Some(PipeEntry::Pending) => { self.pending_skips += 1; return None; }
+            Some(PipeEntry::Pending) => {
+                // being compiled (by an earlier draw or the warm-up): wait for it like a new one
+                let start = Instant::now();
+                let deadline = start + self.pipe_wait_left;
+                while !matches!(self.pipelines.get(&key), Some(PipeEntry::Done(_))) {
+                    let Ok((done, pipeline)) = self.pipe_results.recv_timeout(deadline.saturating_duration_since(Instant::now())) else { break };
+                    self.finish_pipeline(done, pipeline);
+                }
+                self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+                if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) { return p.clone(); }
+                self.pending_skips += 1;
+                return None;
+            }
             None => {}
         }
         self.pipe_creates += 1;
-        let Some((job, vb_req)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi) else {
+        let Some((job, vb_req)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi, &st) else {
             self.pipelines.insert(key, PipeEntry::Done(None));
             return None;
         };
+        self.record_recipe(vs, ps, layout, &strides, strip_code, &st, &pi);
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
             self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
@@ -2523,8 +2584,8 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo) -> Option<(PipeJob, Vec<VbReq>)> {
-        let vs_obj_sig = self.vs_sig()?;
+    fn create_pipeline(&mut self, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>, strides: &[u32], topo: PrimitiveTopology, strip_fmt: Option<IndexFormat>, pi: &PassInfo, st: &PipeStates) -> Option<(PipeJob, Vec<VbReq>)> {
+        let vs_obj_sig = st.sig.clone();
         let label = format!("{} + {}", vs.label, ps.map(|p| p.label.as_str()).unwrap_or("-"));
         let bgl0 = if vs.info.bindings.iter().any(|b| b.group == 0) { self.bgl_for(vs, 0, 0).0 } else { self.empty_bgl() };
         let bgl1 = match ps { Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1).0, _ => self.empty_bgl() };
@@ -2549,9 +2610,7 @@ impl Gpu {
             vb_req.push(VbReq { slot: *slot, instance: *step == VertexStepMode::Instance, stride, last });
         }
 
-        let rs = if self.s.rs != 0 { self.state(self.s.rs) } else { None };
-        let blend = if self.s.blend.0 != 0 { self.state(self.s.blend.0) } else { None };
-        let dss = if self.s.dss.0 != 0 { self.state(self.s.dss.0) } else { None };
+        let (rs, blend, dss) = (st.rs.clone(), st.blend.clone(), st.dss.clone());
         let mut primitive = PrimitiveState { topology: topo, strip_index_format: strip_fmt, ..Default::default() };
         match &rs {
             Some(r) => {
@@ -2606,6 +2665,115 @@ impl Gpu {
         while let Ok((id, pipeline)) = self.pipe_results.try_recv() {
             self.finish_pipeline(id, pipeline);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_key(&self, vs: &Program, ps: Option<&Rc<Program>>, layout: &LayoutObj, strides: &[u32], topo: u32, strip_code: i64, st: &PipeStates, pi: &PassInfo) -> Vec<i64> {
+        let mut key: Vec<i64> = vec![vs.stable as i64, ps.map(|p| p.stable as i64).unwrap_or(0), layout.stable as i64];
+        for uid in std::iter::once(vs.uid).chain(ps.map(|p| p.uid)) {
+            if let Some(m) = self.unfilt.get(&uid) { key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]); }
+        }
+        for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
+        let sid = |s: &Option<Rc<StateObj>>| s.as_ref().map(|s| s.stable as i64).unwrap_or(0);
+        key.extend([topo as i64, strip_code, sid(&st.blend), sid(&st.dss), sid(&st.rs)]);
+        for f in &pi.rt_formats { key.push(f.map(format_id).unwrap_or(-1)); }
+        key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
+        key
+    }
+
+    /// Appends what a new pipeline was built from, so the next launch can build it during loading.
+    #[allow(clippy::too_many_arguments)]
+    fn record_recipe(&mut self, vs: &Program, ps: Option<&Rc<Program>>, layout: &LayoutObj, strides: &[u32], strip_code: i64, st: &PipeStates, pi: &PassInfo) {
+        if !*PIPE_CACHE || vs.hash.is_empty() || ps.is_some_and(|p| p.hash.is_empty()) || self.recipe_bytes > RECIPE_LIMIT { return; }
+        let mask = |uid: u64| self.unfilt.get(&uid).map(|m| [m.0.to_string(), m.1.to_string()]);
+        let words = |s: &Option<Rc<StateObj>>| s.as_ref().map(|s| s.words.clone());
+        let r = serde_json::json!({
+            "vs": vs.hash, "ps": ps.map(|p| p.hash.clone()),
+            "sig": st.sig.iter().map(|e| [e.sem, e.idx, e.reg]).collect::<Vec<_>>(),
+            "els": layout.els.iter().map(|e| [e.sem, e.idx, e.fmt, e.slot, e.offset, e.cls]).collect::<Vec<_>>(),
+            "slots": layout.slots, "strides": strides, "topo": self.s.topo, "strip": strip_code,
+            "rs": words(&st.rs), "blend": words(&st.blend), "dss": words(&st.dss),
+            "rt": pi.rt_formats.iter().map(|f| f.map(|f| format!("{f:?}"))).collect::<Vec<_>>(),
+            "ds": pi.ds_format.map(|f| format!("{f:?}")), "samples": pi.samples, "rod": pi.ro_depth, "ros": pi.ro_stencil,
+            "uv": mask(vs.uid), "up": ps.and_then(|p| mask(p.uid)),
+        });
+        let line = format!("{r}\n");
+        self.recipe_bytes += line.len() as u64;
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.recipe_path()) { let _ = f.write_all(line.as_bytes()); }
+    }
+
+    fn recipe_path(&self) -> PathBuf {
+        self.shader_dir.parent().unwrap_or(&self.shader_dir).join("pipelines-v1.jsonl")
+    }
+
+    fn load_recipes(&mut self) {
+        if !*PIPE_CACHE { return; }
+        let Ok(text) = std::fs::read_to_string(self.recipe_path()) else { return };
+        self.recipe_bytes = text.len() as u64;
+        self.warm = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        log(&format!("pipeline cache: {} recipes to build during loading", self.warm.len()));
+        self.warm_t0 = Some(Instant::now());
+    }
+
+    /// Builds saved pipelines while the worker is idle, a few milliseconds at a time,
+    /// without letting them queue ahead of pipelines the game is waiting for.
+    fn warm_step(&mut self, budget: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < budget && self.pipe_pending.len() < 8 {
+            let Some(r) = self.warm.pop_front() else { break };
+            if self.warm_one(&r).is_some() { self.warmed += 1; }
+        }
+        if self.warm.is_empty() {
+            if let Some(t0) = self.warm_t0.take() { log(&format!("pipeline cache: built {} pipelines in {:.1} s", self.warmed, t0.elapsed().as_secs_f64())); }
+        }
+    }
+
+    fn warm_one(&mut self, r: &serde_json::Value) -> Option<()> {
+        let u = |v: &serde_json::Value| v.as_u64().map(|x| x as u32);
+        let arr = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+        let words = |v: &serde_json::Value| v.as_array().map(|a| Rc::new(StateObj { words: a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect::<Vec<_>>(), sampler: None, stable: 0 })).map(|mut s| { Rc::get_mut(&mut s).unwrap().stable = stable_hash(&s.words); s });
+        let vs = self.warm_program(r["vs"].as_str()?, 0)?;
+        let ps = match r["ps"].as_str() { Some(h) => Some(self.warm_program(h, 1)?), None => None };
+        for (p, m) in std::iter::once((&vs, &r["uv"])).chain(ps.iter().map(|p| (p, &r["up"]))) {
+            if let Some(m) = m.as_array() {
+                let a: u128 = m.first()?.as_str()?.parse().ok()?;
+                let b: u128 = m.get(1)?.as_str()?.parse().ok()?;
+                self.unfilt.insert(p.uid, (a, b));
+            }
+        }
+        let els: Vec<El> = arr(&r["els"]).iter().filter_map(|e| { let e = e.as_array()?; let g = |i: usize| e.get(i).and_then(u); Some(El { sem: g(0)?, idx: g(1)?, fmt: g(2)?, slot: g(3)?, offset: g(4)?, cls: g(5)? }) }).collect();
+        let slots: Vec<(u32, u32)> = arr(&r["slots"]).iter().filter_map(|s| { let s = s.as_array()?; Some((u(s.first()?)?, u(s.get(1)?)?)) }).collect();
+        let layout = Rc::new(LayoutObj { stable: layout_stable(&els, &slots), els, slots });
+        let strides: Vec<u32> = arr(&r["strides"]).iter().filter_map(u).collect();
+        if strides.len() != 16 { return None; }
+        let st = PipeStates {
+            sig: arr(&r["sig"]).iter().filter_map(|e| { let e = e.as_array()?; Some(SigEl { sem: u(e.first()?)?, idx: u(e.get(1)?)?, reg: u(e.get(2)?)? }) }).collect(),
+            rs: words(&r["rs"]), blend: words(&r["blend"]), dss: words(&r["dss"]),
+        };
+        let fmt = |v: &serde_json::Value| -> Option<Option<TextureFormat>> { match v.as_str() { None => Some(None), Some(n) => parse_format(n).map(Some) } };
+        let rt_formats = arr(&r["rt"]).iter().map(fmt).collect::<Option<Vec<_>>>()?;
+        let pi = PassInfo { rt_formats, samples: u(&r["samples"])?, ds_format: fmt(&r["ds"])?, ro_depth: r["rod"].as_bool()?, ro_stencil: r["ros"].as_bool()?, width: 1, height: 1 };
+        let topo_raw = u(&r["topo"])?;
+        let (topo, _) = topology(topo_raw);
+        let strip_code = r["strip"].as_i64()?;
+        let strip_fmt = match strip_code { 1 => Some(IndexFormat::Uint16), 2 => Some(IndexFormat::Uint32), _ => None };
+        let key = self.pipe_key(&vs, ps.as_ref(), &layout, &strides, topo_raw, strip_code, &st, &pi);
+        if self.pipelines.contains_key(&key) { return None; }
+        let (job, vb_req) = self.create_pipeline(&vs, ps.as_ref(), &layout, &strides, topo, strip_fmt, &pi, &st)?;
+        let tx = self.pipe_jobs.clone()?;
+        let id = self.uid();
+        self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
+        self.pipelines.insert(key, PipeEntry::Pending);
+        let _ = tx.send((id, job));
+        Some(())
+    }
+
+    fn warm_program(&mut self, hash: &str, stage: u32) -> Option<Rc<Program>> {
+        if let Some(p) = self.warm_programs.get(hash) { return p.clone(); }
+        let p = self.load_program(hash, stage);
+        self.warm_programs.insert(hash.to_string(), p.clone());
+        p
     }
 
     fn finish_pipeline(&mut self, id: u64, pipeline: Option<RenderPipeline>) {
@@ -2846,7 +3014,7 @@ impl Gpu {
                         for b in &info.bindings { gb.entry(b.group).or_default().push(b.clone()); }
                         for v in gb.values_mut() { v.sort_by_key(|b| b.binding); }
                         let uid = self.uid();
-                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
+                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, stable: uid | 1 << 63, hash: String::new(), vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
                     }
                     None => { self.compute.insert(key.clone(), None); self.skipped += 1; return; }
                 }
