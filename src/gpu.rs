@@ -1834,9 +1834,13 @@ impl Gpu {
         }
     }
     fn mark_depth_dirty(&mut self, id: u32) {
+        self.mark_ds_dirty(id, true, true);
+    }
+    /// A pass that can write only depth, or only stencil, still changes that aspect's proxy.
+    fn mark_ds_dirty(&mut self, id: u32, depth: bool, stencil: bool) {
         if let Some(t) = self.tex_mut(id) {
-            if let Some(p) = t.proxy_depth.as_mut() { p.dirty = true; }
-            if let Some(p) = t.proxy_stencil.as_mut() { p.dirty = true; }
+            if depth { if let Some(p) = t.proxy_depth.as_mut() { p.dirty = true; } }
+            if stencil { if let Some(p) = t.proxy_stencil.as_mut() { p.dirty = true; } }
         }
     }
 
@@ -1875,7 +1879,7 @@ impl Gpu {
         let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
         if ds.tex != 0 && self.tex(ds.tex).is_some() {
             if let Some((v, f)) = self.target_view(ds.tex, 0, ds.mip, ds.slice) {
-                if !ro_d && !ro_s { self.mark_depth_dirty(ds.tex); }
+                self.mark_ds_dirty(ds.tex, !ro_d, !ro_s);
                 let t = self.tex(ds.tex).unwrap();
                 ds_format = Some(f);
                 samples = t.desc.samples;
