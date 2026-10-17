@@ -121,25 +121,25 @@ pub struct D3dMaps {
     live: HashMap<u32, u64>,
     /// uploads matched against the shadows so far, for ids whose resource is still unknown
     tries: HashMap<u32, u32>,
+    /// ids that are mapped right now
+    mapped: std::collections::HashSet<u32>,
+    /// id -> number of Maps so far (the game writes into a shadow only after mapping it)
+    map_seq: HashMap<u32, u64>,
 }
 static D3D: LazyLock<Mutex<D3dMaps>> = LazyLock::new(|| Mutex::new(D3dMaps::default()));
-thread_local! { static UNMAPPING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+// the resource Unmap is releasing on this thread: (Map's key, shadow pointer, map type)
+thread_local! { static UNMAPPING: std::cell::Cell<(u64, u64, u32)> = const { std::cell::Cell::new((0, 0, 0)) }; }
 
 /// `wasm_null_d3d::GpuUploadBuffer(id, offset, data, size, mode)`: when called from Unmap, it tells
 /// which ring id the resource being unmapped uploads to. (The function is partly inlined, so not
 /// every upload comes through here; `learn_shadow` covers the rest.)
 pub fn d3d_upload(id: u32, _offset: u64, _data: u64, _size: u64) {
-    let res = UNMAPPING.with(|u| u.replace(0));
-    if res == 0 { return; }
+    let (key, p, ty) = UNMAPPING.with(|u| u.replace((0, 0, 0)));
+    if key == 0 { return; }
     let mut d = D3D.lock().unwrap();
-    // Map sees the resource through another interface pointer than Unmap (a small constant offset)
-    let key = if d.by_res.contains_key(&res) { Some(res) } else { d.by_res.keys().copied().filter(|&k| k > res && k - res < 0x200).min() };
-    if let Some(key) = key {
-        d.res_to_id.insert(key, id);
-        if let Some((p, ty)) = d.by_res.get(&key).copied() {
-            if ty == MAP_WRITE_NO_OVERWRITE && p != 0 { d.live.insert(id, p); }
-        }
-    }
+    d.res_to_id.insert(key, id);
+    if ty == MAP_WRITE_NO_OVERWRITE && p != 0 { d.live.insert(id, p); }
+    d.mapped.remove(&id);
 }
 /// `NullContext::Map` returned: `mapped` points at the D3D11_MAPPED_SUBRESOURCE it filled.
 pub fn d3d_map(mem: &SharedMemory, res: u64, ty: u32, mapped: u64) {
@@ -150,13 +150,21 @@ pub fn d3d_map(mem: &SharedMemory, res: u64, ty: u32, mapped: u64) {
     let mut d = D3D.lock().unwrap();
     d.by_res.insert(res, (pdata, ty));
     d.shadows.insert(pdata, (res, ty));
-    if ty == MAP_WRITE_NO_OVERWRITE {
-        if let Some(id) = d.res_to_id.get(&res).copied() { d.live.insert(id, pdata); }
+    if let Some(id) = d.res_to_id.get(&res).copied() {
+        d.mapped.insert(id);
+        *d.map_seq.entry(id).or_insert(0) += 1;
+        if ty == MAP_WRITE_NO_OVERWRITE { d.live.insert(id, pdata); }
     }
 }
 pub fn d3d_unmap(res: u64) {
-    D3D.lock().unwrap().by_res.remove(&res);
-    UNMAPPING.with(|u| u.set(res));
+    let mut d = D3D.lock().unwrap();
+    // Map sees the resource through another interface pointer than Unmap (a small constant offset)
+    let key = if d.by_res.contains_key(&res) { Some(res) } else { d.by_res.keys().copied().filter(|&k| k > res && k - res < 0x200).min() };
+    let Some(key) = key else { return };
+    let (p, ty) = d.by_res.remove(&key).unwrap_or((0, 0));
+    if let Some(id) = d.res_to_id.get(&key).copied() { d.mapped.remove(&id); }
+    drop(d);
+    UNMAPPING.with(|u| u.set((key, p, ty)));
 }
 
 static MEM_STATS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_MEM_STATS").is_ok_and(|v| v != "0"));
@@ -654,7 +662,7 @@ struct Buf {
     upload_end: u64,
 }
 /// Our copy of a WRITE_NO_OVERWRITE mapped buffer's shadow, as last uploaded.
-struct LiveBuf { ptr: u64, mirror: Vec<u8>, frame: u64 }
+struct LiveBuf { ptr: u64, mirror: Vec<u8>, frame: u64, seq: u64 }
 #[derive(Clone, Copy)]
 struct SigEl { sem: u32, idx: u32, reg: u32 }
 struct ShaderObj {
@@ -917,6 +925,7 @@ pub struct Gpu {
     last_submit: Option<SubmissionIndex>,
     vb_avail: [u64; 16],
     live: HashMap<u32, LiveBuf>,
+    live_checked: HashMap<u32, u64>,
     live_synced: u64,
     live_blocks: u64,
     dbg_idx: u64,
@@ -1054,7 +1063,7 @@ impl Gpu {
             proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
-            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16], live: HashMap::new(), live_synced: 0, live_blocks: 0,
+            frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16], live: HashMap::new(), live_checked: HashMap::new(), live_synced: 0, live_blocks: 0,
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0, errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
@@ -1399,6 +1408,19 @@ impl Gpu {
         if id == 0 { return; }
         let frame = self.presents;
         if self.live.get(&id).is_some_and(|l| l.frame == frame) { return; }
+        if let Some(l) = self.live.get_mut(&id) {
+            // the game writes into a shadow only after mapping it: compare only if the buffer is
+            // mapped now or has been mapped again since we last compared
+            l.frame = frame;
+            let (mapped, seq) = { let d = D3D.lock().unwrap(); (d.mapped.contains(&id), d.map_seq.get(&id).copied().unwrap_or(0)) };
+            if !mapped && seq == l.seq { return; }
+            l.seq = seq;
+            l.frame = frame.wrapping_sub(1);
+        } else {
+            // ask the shared map at most once per frame per buffer
+            if self.live_checked.get(&id) == Some(&frame) { return; }
+            self.live_checked.insert(id, frame);
+        }
         let Some((g, bytes, upload_end)) = self.buf(id).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes as usize, b.upload_end as usize))) else { return };
         let (base, len) = mem_base_len(&self.mem);
         if !self.live.contains_key(&id) {
@@ -1408,7 +1430,7 @@ impl Gpu {
             // our GPU copy may already lag the shadow: start from the shadow's content
             let mirror = unsafe { std::slice::from_raw_parts(base.add(p), bytes) }.to_vec();
             self.queue.write_buffer(&g, 0, &mirror);
-            self.live.insert(id, LiveBuf { ptr, mirror, frame });
+            self.live.insert(id, LiveBuf { ptr, mirror, frame, seq: 0 });
             return;
         }
         let l = self.live.get_mut(&id).unwrap();
@@ -1531,6 +1553,10 @@ impl Gpu {
     fn upload_buffer(&mut self, id: u32, offset: u64, size: u64, data_addr: u64, no_overwrite: bool) {
         let data = self.bytes(data_addr, size).to_vec();
         if *LIVE_MAPS && no_overwrite && size >= 64 && !self.live.contains_key(&id) { self.learn_shadow(id, offset, &data); }
+        if let Some(l) = self.live.get_mut(&id) {
+            let end = ((offset + size) as usize).min(l.mirror.len());
+            if (offset as usize) < end { l.mirror[offset as usize..end].copy_from_slice(&data[..end - offset as usize]); }
+        }
         let used = self.used(id);
         let Some(b) = self.buf_mut(id) else { return };
         b.upload_end = offset + size;
