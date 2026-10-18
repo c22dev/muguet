@@ -133,6 +133,9 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
             export_call(&mut caller, "_emscripten_thread_init", &[Val::I64(tb), Val::I32(1), Val::I32(1), Val::I32(1), Val::I64(1_048_576), Val::I32(0)])?;
         }
         "muguet_script" => crate::mp::script_tick(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
+        "muguet_gpu_upload" => crate::gpu::d3d_upload(int(params, 0) as u32, int(params, 1) as u64, int(params, 2) as u64, int(params, 3) as u64),
+        "muguet_d3d_map" => { let r = int(params, 0); crate::gpu::d3d_map(mem, int(params, 1) as u64, int(params, 3) as u32, int(params, 4) as u64, r as i32); set_int(results, r) }
+        "muguet_d3d_unmap" => crate::gpu::d3d_unmap(int(params, 0) as u64),
         "muguet_explosion" => crate::mp::explosion(int(params, 0) as u64),
         "muguet_timewarp" => set_int(results, crate::mp::time_warp(int(params, 0))),
         "muguet_resource_map" => merge_physical_pages(mem, int(params, 0) as u64),
