@@ -143,11 +143,12 @@ pub fn d3d_upload(id: u32, _offset: u64, _data: u64, _size: u64) {
     d.mapped.remove(&id);
 }
 /// `NullContext::Map` returned: `mapped` points at the D3D11_MAPPED_SUBRESOURCE it filled.
-pub fn d3d_map(mem: &SharedMemory, res: u64, ty: u32, mapped: u64) {
+pub fn d3d_map(mem: &SharedMemory, res: u64, ty: u32, mapped: u64, hr: i32) {
     let (base, len) = mem_base_len(mem);
     let p = mapped as usize;
-    let pdata = if p + 8 <= len { unsafe { std::ptr::read_unaligned(base.add(p) as *const u64) } } else { 0 };
-    if pdata == 0 { return; }
+    let pdata = if p.checked_add(8).is_some_and(|e| e <= len) { unsafe { std::ptr::read_unaligned(base.add(p) as *const u64) } } else { 0 };
+    // a failed Map leaves pData unset: keep only pointers into the game's memory
+    if hr != 0 || pdata == 0 || pdata as usize >= len { return; }
     let mut d = D3D.lock().unwrap();
     d.by_res.insert(res, (pdata, ty));
     d.shadows.insert(pdata, (res, ty));
@@ -1451,8 +1452,8 @@ impl Gpu {
         if data.iter().all(|&b| b == 0) { return; }
         let (base, len) = mem_base_len(&self.mem);
         let found = d.shadows.iter().find(|(&ptr, _)| {
-            let at = ptr as usize + offset as usize;
-            at + data.len() <= len && unsafe { std::slice::from_raw_parts(base.add(at), data.len()) } == data
+            let Some(at) = (ptr as usize).checked_add(offset as usize) else { return false };
+            at.checked_add(data.len()).is_some_and(|e| e <= len) && unsafe { std::slice::from_raw_parts(base.add(at), data.len()) } == data
         }).map(|(&ptr, &(res, ty))| (ptr, res, ty));
         if let Some((ptr, res, ty)) = found {
             d.res_to_id.insert(res, id);
@@ -1483,7 +1484,7 @@ impl Gpu {
         if !self.live.contains_key(&id) {
             let Some(ptr) = D3D.lock().unwrap().live.get(&id).copied() else { return };
             let p = ptr as usize;
-            if p == 0 || p + bytes > len { return; }
+            if p == 0 || p.checked_add(bytes).is_none_or(|e| e > len) { return; }
             // our GPU copy may already lag the shadow: start from the shadow's content
             let mirror = unsafe { std::slice::from_raw_parts(base.add(p), bytes) }.to_vec();
             self.queue.write_buffer(&g, 0, &mirror);
@@ -1493,7 +1494,7 @@ impl Gpu {
         let l = self.live.get_mut(&id).unwrap();
         l.frame = frame;
         let p = l.ptr as usize;
-        if p + bytes > len { return; }
+        if p.checked_add(bytes).is_none_or(|e| e > len) { return; }
         let shadow = unsafe { std::slice::from_raw_parts(base.add(p), bytes) };
         let (lo, hi) = if bytes <= LIVE_FULL_MAX { (0, bytes) } else { (upload_end.saturating_sub(LIVE_BLOCK), (upload_end + LIVE_WINDOW).min(bytes)) };
         let mut writes: Vec<(usize, usize)> = Vec::new();
