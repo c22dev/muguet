@@ -140,7 +140,8 @@ enum Preset: String, CaseIterable {
         let gb = Double(memoryLimit()) / 1_073_741_824
         let family = MTLCreateSystemDefaultDevice().map { d in (7...12).last { d.supportsFamily(MTLGPUFamily(rawValue: 1000 + $0)!) } ?? 0 } ?? 0
         if gb < 4 || family < 8 { return .battery }
-        if family >= 9 && gb >= 5 { return .quality }
+        // Quality uses higher resolution and textures; require more memory headroom before recommending it.
+        if family >= 9 && gb >= 8 { return .quality }
         return .balanced
     }()
 }
