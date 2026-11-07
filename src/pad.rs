@@ -78,6 +78,7 @@ struct State {
     buttons: u8,
     last: Instant,
     down_since: Option<Instant>,
+    cycle: i8,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -108,7 +109,7 @@ pub fn poll() -> bool {
         eprintln!("[pad] controller connected");
     }
     let mut guard = STATE.lock().unwrap();
-    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None });
+    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None, cycle: 0 });
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
@@ -131,13 +132,21 @@ pub fn poll() -> bool {
             if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
             if gp.leftTrigger().value() > 0.2 { keys.insert("KeyS"); }
         } else if in_car {
+            let passenger = VEH_MODE.load(Ordering::Relaxed) == MODE_PASSENGER;
+            let (rt, lt) = (gp.rightTrigger().value() > 0.2, gp.leftTrigger().value() > 0.2);
+            let aim = down(&gp.leftShoulder()) || (passenger && lt);
+            let fire = (aim && down(&gp.rightShoulder())) || (passenger && rt);
+            if aim { buttons |= 2; }
+            if fire { buttons |= 1; }
             if lx < -STICK_DEADZONE { keys.insert("KeyA"); }
             if lx > STICK_DEADZONE { keys.insert("KeyD"); }
             if ly > STICK_DEADZONE { keys.insert("Numpad8"); }
             if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
-            if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
-            if gp.leftTrigger().value() > 0.2 { keys.insert("KeyS"); }
-            if down(&gp.rightShoulder()) { keys.insert("Space"); }
+            if !passenger {
+                if rt { keys.insert("KeyW"); }
+                if lt { keys.insert("KeyS"); }
+                if down(&gp.rightShoulder()) && !aim { keys.insert("Space"); }
+            }
             HORN_PAD.store(gp.leftThumbstickButton().is_some_and(|b| down(&b)), Ordering::Relaxed);
             if down(&gp.buttonX()) { keys.insert("Space"); }
         } else {
@@ -155,9 +164,13 @@ pub fn poll() -> bool {
         if down(&gp.buttonA()) { keys.insert("Enter"); }
         if down(&gp.buttonB()) { keys.insert("KeyR"); keys.insert("Backspace"); }
         if down(&gp.buttonY()) { keys.insert("KeyF"); }
-        if down(&gp.leftShoulder()) && !in_air { keys.insert("Tab"); }
+        if down(&gp.leftShoulder()) && !in_car { keys.insert("Tab"); }
         if gp.rightThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyC"); }
         let dp = gp.dpad();
+        let cycling = in_car && !in_air && down(&gp.leftShoulder());
+        let cycle = if cycling { down(&dp.right()) as i8 - down(&dp.left()) as i8 } else { 0 };
+        if cycle != 0 && cycle != st.cycle { input::wheel(-cycle as i32); }
+        st.cycle = cycle;
         if down(&dp.up()) { keys.insert("ArrowUp"); }
         if down(&dp.down()) {
             let since = *st.down_since.get_or_insert_with(Instant::now);
@@ -165,8 +178,8 @@ pub fn poll() -> bool {
         } else {
             st.down_since = None;
         }
-        if down(&dp.left()) { keys.insert("ArrowLeft"); }
-        if down(&dp.right()) { keys.insert("ArrowRight"); }
+        if down(&dp.left()) && !cycling { keys.insert("ArrowLeft"); }
+        if down(&dp.right()) && !cycling { keys.insert("ArrowRight"); }
         if down(&gp.buttonMenu()) { keys.insert("Escape"); }
         if gp.buttonOptions().is_some_and(|b| down(&b)) { keys.insert("KeyV"); }
 
