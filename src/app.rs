@@ -132,6 +132,10 @@ impl ApplicationHandler for App {
                     if event.state == ElementState::Pressed { self.unlock(&window); }
                     return;
                 }
+                if let PhysicalKey::Code(winit::keyboard::KeyCode::AltRight) = event.physical_key {
+                    if !event.repeat { input::button(2, event.state == ElementState::Pressed); }
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let name = format!("{code:?}");
                     if event.state == ElementState::Pressed && !event.repeat {
